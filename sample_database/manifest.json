@@ -1,0 +1,13 @@
+{
+  "format_version": 1,
+  "dataset": "MSR-VTT",
+  "split": "JSFusion test 1k",
+  "count": 1000,
+  "embedding_dim": 512,
+  "dtype": "float32",
+  "normalized": true,
+  "model_variant": "CLIP4Clip fine-tuned on MSR-VTT 9k",
+  "vectors_source": "https://huggingface.co/Searchium-ai/clip4clip-webvid150k/resolve/main/Notebooks/features/MSRVTT_test_visual_vectors_Cl4Cl_msrvtt9k.npy",
+  "split_source": "https://github.com/ArrowLuo/CLIP4Clip/releases/download/v0.0/msrvtt_data.zip",
+  "sha256": "3234cf34e1d63e2008d3c9ff2a1e7da909a46adf9080f7ea3f99b5f524cff784"
+}

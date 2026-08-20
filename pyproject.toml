@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "msrvtt-embedding-db"
+version = "0.1.0"
+description = "Compact, file-backed MSR-VTT video embedding database with capacity planning and vector packing"
+readme = "EMBEDDING_DB.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+keywords = ["video-retrieval", "clip4clip", "embeddings", "msr-vtt", "vector-database"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+# Core storage, packing, capacity planning and evaluation need nothing but NumPy.
+dependencies = ["numpy>=1.24"]
+
+[project.optional-dependencies]
+# Only `build` (video decoding) and `search` (text encoding) need these.
+inference = [
+    "opencv-python>=4.8",
+    "torch>=2.1",
+    "transformers>=4.37,<5",
+    "safetensors>=0.4",
+]
+
+[project.scripts]
+embedding-db = "embedding_db.cli:main"
+
+[tool.setuptools]
+packages = ["embedding_db"]
