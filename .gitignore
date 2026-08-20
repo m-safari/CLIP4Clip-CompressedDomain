@@ -1,2 +1,16 @@
 .git
 .idea
+__pycache__/
+*.py[cod]
+embedding-output/
+benchmark_model/
+benchmark_output*/
+benchmark_videos/
+features/
+msrvtt_1k_db*/
+tests/work-*/
+packed_*/
+*.egg-info/
+build/
+dist/
+.venv/
