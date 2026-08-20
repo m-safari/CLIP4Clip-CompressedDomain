@@ -1,4 +1,161 @@
-# CLIP4Clip: An Empirical Study of CLIP for End to End Video Clip Retrieval
+# CLIP4Clip — Compressed Domain
+
+A variant of [CLIP4Clip](https://github.com/ArrowLuo/CLIP4Clip) exploring video
+retrieval in the compressed domain. Upstream's full documentation is preserved
+[below](#upstream-clip4clip).
+
+**Components:**
+
+| Component | Purpose |
+|---|---|
+| [`compressed_domain/`](compressed_domain/) | Motion-vector and residual encoders — in development |
+| [`embedding_db/`](embedding_db/) | Turns an MSR-VTT sample into a portable vector database, with capacity planning and vector packing |
+| `modules/`, `dataloaders/`, `main_task_retrieval.py` | Upstream CLIP4Clip training and evaluation, unchanged |
+
+`embedding_db/` is self-contained: it depends only on NumPy for storage,
+packing, capacity planning and evaluation, and pulls in torch/transformers only
+when it has to encode something. It does not import the rest of the repository.
+
+---
+
+# The embedding database
+
+Turns a sample of MSR-VTT into a compact, portable vector database: one
+normalized 512-dimensional CLIP4Clip vector per video, stored as plain `.npy`
+files. No server, no index format, no hosted vector database.
+
+The shipped database is real — 1,000 MSR-VTT test videos with captions, scoring
+**R@1 = 43.40** on text-to-video retrieval, which matches the published
+CLIP4Clip meanP figure for MSR-VTT-9k.
+
+## Quickstart
+
+```bash
+pip install -r requirements-embedding.txt
+```
+
+Build the database from the vectors and split CSV already in the repo. This
+loads no model and takes about a second:
+
+```bash
+python -m embedding_db import-vectors --vectors sample_database/embeddings.npy --split-csv sample_database/MSRVTT_JSFUSION_test.csv --output-dir msrvtt_1k_db --model Searchium-ai/clip4clip-webvid150k
+```
+
+Search it:
+
+```bash
+python -m embedding_db search --db msrvtt_1k_db --query "a person is playing guitar" --top-k 10
+```
+
+Use it from Python:
+
+```python
+from embedding_db import EmbeddingDatabase
+
+db = EmbeddingDatabase("msrvtt_1k_db")
+for hit in db.search_vector(query_vector, top_k=5):
+    print(hit["rank"], hit["video_id"], hit["score"], hit["caption"])
+```
+
+## How much fits in a storage budget
+
+For a 2 GiB budget at 512 dimensions, including the measured 127 bytes of
+per-item metadata:
+
+| Packing | Bytes/item | Items in 2 GiB | 1,000 items | R@1 |
+|---|---:|---:|---:|---:|
+| float32 | 2,175 | 987,176 | 2.1 MB | 43.40 |
+| float16 | 1,151 | 1,865,140 | 1.1 MB | 43.20 |
+| int8 | 643 | 3,337,820 | 0.6 MB | 42.80 |
+| binary | 191 | 11,221,103 | 0.2 MB | 29.30 |
+
+Vectors are cheap. A 2,000-item database is **0.2%** of a 2 GiB budget, and the
+entire 10,000-video MSR-VTT dataset is 20 MB of float32 vectors. The budget only
+begins to bind near a million items.
+
+The packing trade-off, measured on the real vectors rather than assumed:
+float16 costs 0.2 points of R@1 for half the size, int8 costs 0.6 points for a
+quarter, and binary is 32x smaller but gives up 14 points — useful as a cheap
+first-stage filter that a float32 pass reranks, not as the only copy.
+
+Check any budget against your own database:
+
+```bash
+python -m embedding_db estimate --budget 2GiB --db msrvtt_1k_db
+```
+
+## Commands
+
+| Command | Purpose | Loads a model? |
+|---|---|---|
+| `estimate` | Size vectors, or fit them to a storage budget | No |
+| `import-vectors` | Turn a vector matrix plus a split CSV into a database | No |
+| `pack` | Rewrite a database as float16, int8, or binary | No |
+| `compare` | Score every packing against the stored float32 vectors | No |
+| `evaluate` | Text-to-video R@1 / R@5 / R@10 / MedianR (needs a 2 MB text-vector file, see [`EMBEDDING_DB.md`](EMBEDDING_DB.md#validation)) | No |
+| `search` | Text query against the database | Yes |
+| `build` | Embed raw video files into a new database | Yes |
+
+Only the two commands that need to encode something load a checkpoint.
+
+## Storage layout
+
+| File | Contents |
+|---|---|
+| `embeddings.npy` | `(N, D)` vectors in the manifest's packing |
+| `scales.npy` | per-row float32 scales; int8 packing only |
+| `completed.npy` | valid-row mask, also used for safe resume |
+| `items.jsonl` | row to video id, path, and caption |
+| `manifest.json` | packing, dimensions, provenance, build config |
+| `benchmark.json` | timings, written by `build` |
+| `failures.jsonl` | unreadable videos, written by `build` |
+
+Recommended storage: plain files on a persistent volume. At a few megabytes
+there is no case for FAISS or a hosted vector database, and exact NumPy cosine
+search stays appropriate well past this scale.
+
+## Building from raw video
+
+To embed videos yourself instead of importing published vectors:
+
+```bash
+python -m embedding_db build --videos-dir /datasets/MSRVTT/MSRVTT_Videos --split-csv /datasets/MSRVTT/MSRVTT_train.9k.csv --output-dir /storage/msrvtt-2k-embeddings --limit 2000 --device cuda --precision float16
+```
+
+Interrupted jobs resume with the same arguments plus `--resume`. Videos are the
+expensive part, not vectors: the raw MSR-VTT set is a 2.19 GB download
+([friedrichor/MSR-VTT](https://huggingface.co/datasets/friedrichor/MSR-VTT)
+mirrors all 10,000 clips) and the checkpoint another 605 MB, neither of which is
+copied into the database.
+
+Timing for this path has **not** been measured end to end — see
+[`BENCHMARK_RESULTS.md`](BENCHMARK_RESULTS.md) for exactly what was and was not
+measured.
+
+## Tests
+
+```bash
+python -m unittest discover -s tests -v
+```
+
+29 tests. They download nothing and load no checkpoint.
+
+## Further reading
+
+- [`EMBEDDING_DB.md`](EMBEDDING_DB.md) — full module documentation
+- [`BENCHMARK_RESULTS.md`](BENCHMARK_RESULTS.md) — measurements, and the limits of each
+- [`sample_database/`](sample_database/) — the published vectors and split CSV
+
+---
+
+# Upstream CLIP4Clip
+
+Everything below this line is the documentation of the original
+[CLIP4Clip](https://github.com/ArrowLuo/CLIP4Clip) repository by Luo et al.,
+kept verbatim. It describes training and evaluating the model itself, which
+is unchanged in this fork.
+
+## CLIP4Clip: An Empirical Study of CLIP for End to End Video Clip Retrieval
 
 (**July 28, 2021**) Add ViT-B/16 with an extra `--pretrained_clip_name`
 
@@ -178,7 +335,7 @@ main_task_retrieval.py --do_train --num_thread_reader=2 \
 --pretrained_clip_name ViT-B/32
 ```
 
-# Citation
+## Citation
 If you find CLIP4Clip useful in your work, you can cite the following paper:
 ```bibtex
 @Article{Luo2021CLIP4Clip,
@@ -189,5 +346,18 @@ If you find CLIP4Clip useful in your work, you can cite the following paper:
 }
 ```
 
-# Acknowledgments
+## Acknowledgments
 Our code is based on [CLIP](https://github.com/openai/CLIP) and [UniVL](https://github.com/microsoft/UniVL).
+
+---
+
+# License and attribution
+
+MIT, inherited from upstream CLIP4Clip (Copyright (c) 2021 ArrowLuo) — see
+[`LICENSE`](LICENSE). Code added in this repository is released under the same
+terms.
+
+The vectors in [`sample_database/`](sample_database/) are published by
+[Searchium-ai/clip4clip-webvid150k](https://huggingface.co/Searchium-ai/clip4clip-webvid150k)
+and the split CSV comes from the CLIP4Clip release data; both are redistributed
+here for reproducibility, not authored by this repository.
