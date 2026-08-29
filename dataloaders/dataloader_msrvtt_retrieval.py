@@ -87,7 +87,7 @@ class MSRVTT_DataLoader(Dataset):
 
         # Pair x L x T x 3 x H x W
         video = np.zeros((len(choice_video_ids), self.max_frames, 1, 3,
-                          self.rawVideoExtractor.size, self.rawVideoExtractor.size), dtype=np.float)
+                          self.rawVideoExtractor.size, self.rawVideoExtractor.size), dtype=float)
 
         for i, video_id in enumerate(choice_video_ids):
             # Individual for YoucokII dataset, due to it video format
@@ -97,6 +97,7 @@ class MSRVTT_DataLoader(Dataset):
 
             raw_video_data = self.rawVideoExtractor.get_video_data(video_path)
             raw_video_data = raw_video_data['video']
+            print(raw_video_data.shape)
             if len(raw_video_data.shape) > 3:
                 raw_video_data_clip = raw_video_data
                 # L x T x 3 x H x W
@@ -249,16 +250,18 @@ class MSRVTT_TrainDataLoader(Dataset):
 
         # Pair x L x T x 3 x H x W
         video = np.zeros((len(choice_video_ids), self.max_frames, 1, 3,
-                          self.rawVideoExtractor.size, self.rawVideoExtractor.size), dtype=np.float)
+                          self.rawVideoExtractor.size, self.rawVideoExtractor.size), dtype=float)
 
         for i, video_id in enumerate(choice_video_ids):
             # Individual for YoucokII dataset, due to it video format
             video_path = os.path.join(self.features_path, "{}.mp4".format(video_id))
+            print(f'video path:{video_path}')
             if os.path.exists(video_path) is False:
                 video_path = video_path.replace(".mp4", ".webm")
 
             raw_video_data = self.rawVideoExtractor.get_video_data(video_path)
             raw_video_data = raw_video_data['video']
+
             if len(raw_video_data.shape) > 3:
                 raw_video_data_clip = raw_video_data
                 # L x T x 3 x H x W

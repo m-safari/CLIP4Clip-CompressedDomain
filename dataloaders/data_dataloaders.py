@@ -1,5 +1,6 @@
 import torch
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoaderfrom dataloaders.dataloader_msrvtt_retrieval import MSRVTT_DataLoader
+
 from dataloaders.dataloader_msrvtt_retrieval import MSRVTT_DataLoader
 from dataloaders.dataloader_msrvtt_retrieval import MSRVTT_TrainDataLoader
 from dataloaders.dataloader_msvd_retrieval import MSVD_DataLoader
