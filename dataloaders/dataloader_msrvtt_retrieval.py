@@ -30,6 +30,11 @@ class MSRVTT_DataLoader(Dataset):
         self.features_path = features_path
         self.feature_framerate = feature_framerate
         self.max_words = max_words
+        # This is the maximum number of sampled frames kept per video.
+        # It does not control how many frames OpenCV initially extracts.
+        # RawVideoExtractor -> extract frames, if too many:
+        # cut/sample to max_frames
+        # pad output tensor to exactly max_frames
         self.max_frames = max_frames
         self.tokenizer = tokenizer
         # 0: ordinary order; 1: reverse order; 2: random order.
@@ -50,7 +55,10 @@ class MSRVTT_DataLoader(Dataset):
         choice_video_ids = [video_id]
         n_caption = len(choice_video_ids)
 
+        # The code's broader architecture supports multiple captions, but here it currently always creates one.
         k = n_caption
+        
+        # preallocate
         pairs_text = np.zeros((k, self.max_words), dtype=np.long)
         pairs_mask = np.zeros((k, self.max_words), dtype=np.long)
         pairs_segment = np.zeros((k, self.max_words), dtype=np.long)
@@ -58,14 +66,20 @@ class MSRVTT_DataLoader(Dataset):
         for i, video_id in enumerate(choice_video_ids):
             words = self.tokenizer.tokenize(sentence)
 
+            # add CLIP special tokens
             words = [self.SPECIAL_TOKEN["CLS_TOKEN"]] + words
             total_length_with_CLS = self.max_words - 1
+            # Truncate if more than max tokens
             if len(words) > total_length_with_CLS:
                 words = words[:total_length_with_CLS]
             words = words + [self.SPECIAL_TOKEN["SEP_TOKEN"]]
 
             input_ids = self.tokenizer.convert_tokens_to_ids(words)
             input_mask = [1] * len(input_ids)
+            
+            # This comes from BERT-style infrastructure.
+            # In a single sentence, everything belongs to segment
+            # For this CLIP retrieval setup, these segment IDs are often structurally retained for compatibility
             segment_ids = [0] * len(input_ids)
             while len(input_ids) < self.max_words:
                 input_ids.append(0)
@@ -82,15 +96,18 @@ class MSRVTT_DataLoader(Dataset):
         return pairs_text, pairs_mask, pairs_segment, choice_video_ids
 
     def _get_rawvideo(self, choice_video_ids):
+        # Preallocate mask
         video_mask = np.zeros((len(choice_video_ids), self.max_frames), dtype=np.long)
         max_video_length = [0] * len(choice_video_ids)
 
         # Pair x L x T x 3 x H x W
+        # Preallocate video tensor
         video = np.zeros((len(choice_video_ids), self.max_frames, 1, 3,
                           self.rawVideoExtractor.size, self.rawVideoExtractor.size), dtype=float)
 
         for i, video_id in enumerate(choice_video_ids):
             # Individual for YoucokII dataset, due to it video format
+            # Expects either .mp4 or .webm as a fallback
             video_path = os.path.join(self.features_path, "{}.mp4".format(video_id))
             if os.path.exists(video_path) is False:
                 video_path = video_path.replace(".mp4", ".webm")
@@ -102,6 +119,8 @@ class MSRVTT_DataLoader(Dataset):
                 raw_video_data_clip = raw_video_data
                 # L x T x 3 x H x W
                 raw_video_slice = self.rawVideoExtractor.process_raw_data(raw_video_data_clip)
+                
+                # Max frame truncatation is applied to whole video
                 if self.max_frames < raw_video_slice.shape[0]:
                     if self.slice_framepos == 0:
                         video_slice = raw_video_slice[:self.max_frames, ...]
@@ -120,10 +139,12 @@ class MSRVTT_DataLoader(Dataset):
                 if slice_len < 1:
                     pass
                 else:
+                    # Copy into the fixed-size output
                     video[i][:slice_len, ...] = video_slice
             else:
                 print("video path: {} error. video id: {}".format(video_path, video_id))
 
+        # Build video mask
         for i, v_length in enumerate(max_video_length):
             video_mask[i][:v_length] = [1] * v_length
 
