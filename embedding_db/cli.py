@@ -6,8 +6,25 @@ import argparse
 import json
 import sys
 
-from .core import DEFAULT_MODEL_ID, BuildConfig, EmbeddingDatabase, build_database, estimate_database_size
+from .config import (
+    DEFAULT_ENCODER,
+    DEFAULT_MODEL_ID,
+    DEFAULT_POOLING,
+    EncoderConfig,
+    encoder_config_from_dict,
+    load_config_file,
+)
+from .core import (
+    BuildConfig,
+    EmbeddingDatabase,
+    build_database,
+    encoder_config_from_manifest,
+    estimate_database_size,
+    release_memmaps,
+)
+from .encoders import available_encoders, create_encoder
 from .evaluate import evaluate_database
+from .model import available_poolings
 from .pack import PACKINGS
 from .storage import (
     capacity_report,
@@ -22,6 +39,68 @@ from .storage import (
 
 def _print(value) -> None:
     print(json.dumps(value, ensure_ascii=False, indent=2))
+
+
+def add_model_arguments(parser: argparse.ArgumentParser) -> None:
+    """Model-facing flags. They default to None so that an explicit flag is
+    distinguishable from a default, which is what lets a config file sit
+    between the defaults and the command line."""
+    group = parser.add_argument_group("model")
+    group.add_argument("--config", help="JSON (or YAML, with PyYAML) file of encoder/build settings")
+    group.add_argument("--encoder", help=f"Encoder backend; available: {', '.join(available_encoders())}")
+    group.add_argument("--model", help="Hub id or local path of the checkpoint")
+    group.add_argument("--revision", help="Checkpoint revision, when the backend supports one")
+    group.add_argument("--cache-dir", help="Where downloaded checkpoints are cached")
+    group.add_argument("--local-files-only", action="store_true", default=None, help="Never reach the network")
+    group.add_argument("--device", help="auto, cpu, cuda, or cuda:N")
+    group.add_argument("--precision", choices=("auto", "float16", "float32"))
+    group.add_argument("--pooling", help=f"Frame pooling; available: {', '.join(available_poolings())}")
+    group.add_argument("--image-size", type=int, help="Override the checkpoint's frame size")
+    group.add_argument("--image-mean", nargs="+", type=float, help="Override normalization mean")
+    group.add_argument("--image-std", nargs="+", type=float, help="Override normalization std")
+
+
+def resolve_configs(args: argparse.Namespace, base: EncoderConfig | None = None) -> tuple[EncoderConfig, dict]:
+    """Apply precedence: defaults < config file < explicit command line."""
+    file_data = load_config_file(args.config) if getattr(args, "config", None) else {}
+    encoder = encoder_config_from_dict(file_data.get("encoder", {}), base)
+
+    overrides = {
+        "name": args.encoder,
+        "model": args.model,
+        "revision": args.revision,
+        "cache_dir": args.cache_dir,
+        "local_files_only": args.local_files_only,
+        "device": args.device,
+        "precision": args.precision,
+        "pooling": args.pooling,
+        "image_size": args.image_size,
+        "image_mean": args.image_mean,
+        "image_std": args.image_std,
+    }
+    encoder = encoder_config_from_dict({k: v for k, v in overrides.items() if v is not None}, encoder)
+    return encoder, dict(file_data.get("build", {}))
+
+
+def build_settings(args: argparse.Namespace, file_build: dict) -> dict:
+    """Non-model build settings, with the same defaults < file < CLI order."""
+    settings = {
+        "storage_dtype": "float32",
+        "frame_rate": 1.0,
+        "max_frames": 12,
+        "frame_batch_size": 128,
+        "video_batch_size": 16,
+        "decode_workers": 4,
+    }
+    unknown = sorted(set(file_build) - set(settings))
+    if unknown:
+        raise SystemExit(f"Unknown build settings {unknown}; valid settings are {sorted(settings)}")
+    settings.update(file_build)
+    for key in settings:
+        value = getattr(args, key, None)
+        if value is not None:
+            settings[key] = value
+    return settings
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -41,18 +120,16 @@ def build_parser() -> argparse.ArgumentParser:
     build.add_argument("--split-csv")
     build.add_argument("--id-column", default="video_id")
     build.add_argument("--limit", type=int, default=2000)
-    build.add_argument("--model", default=DEFAULT_MODEL_ID)
-    build.add_argument("--device", default="auto", help="auto, cpu, cuda, or cuda:N")
-    build.add_argument("--precision", choices=("auto", "float16", "float32"), default="auto")
-    build.add_argument("--storage-dtype", choices=("float16", "float32"), default="float32")
-    build.add_argument("--frame-rate", type=float, default=1.0)
-    build.add_argument("--max-frames", type=int, default=12)
-    build.add_argument("--frame-batch-size", type=int, default=128)
-    build.add_argument("--video-batch-size", type=int, default=16)
-    build.add_argument("--decode-workers", type=int, default=4)
+    build.add_argument("--storage-dtype", choices=("float16", "float32"))
+    build.add_argument("--frame-rate", type=float)
+    build.add_argument("--max-frames", type=int)
+    build.add_argument("--frame-batch-size", type=int)
+    build.add_argument("--video-batch-size", type=int)
+    build.add_argument("--decode-workers", type=int)
     build.add_argument("--overwrite", action="store_true")
     build.add_argument("--resume", action="store_true")
     build.add_argument("--strict", action="store_true", help="Fail if a CSV video is missing")
+    add_model_arguments(build)
 
     importer = commands.add_parser(
         "import-vectors", help="Turn an existing vector matrix plus a split CSV into a database"
@@ -87,8 +164,10 @@ def build_parser() -> argparse.ArgumentParser:
     search.add_argument("--db", required=True)
     search.add_argument("--query", required=True)
     search.add_argument("--top-k", type=int, default=10)
-    search.add_argument("--device", default="auto")
-    search.add_argument("--model", help="Defaults to the model recorded in manifest.json")
+    add_model_arguments(search)
+
+    encoders = commands.add_parser("encoders", help="List the registered encoders and poolings")
+    encoders.add_argument("--json", action="store_true", help="Machine-readable output")
     return parser
 
 
@@ -113,17 +192,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "build":
         if args.overwrite and args.resume:
             raise SystemExit("--overwrite and --resume are mutually exclusive")
-        config = BuildConfig(
-            model_id=args.model,
-            device=args.device,
-            precision=args.precision,
-            storage_dtype=args.storage_dtype,
-            frame_rate=args.frame_rate,
-            max_frames=args.max_frames,
-            frame_batch_size=args.frame_batch_size,
-            video_batch_size=args.video_batch_size,
-            decode_workers=args.decode_workers,
-        )
+        encoder_config, file_build = resolve_configs(args)
+        config = BuildConfig(encoder=encoder_config, **build_settings(args, file_build))
         report = build_database(
             args.videos_dir,
             args.output_dir,
@@ -173,11 +243,21 @@ def main(argv: list[str] | None = None) -> int:
         _print(evaluate_database(args.db, args.text_vectors, tuple(args.recall_at)))
         return 0
 
-    from .model import encode_text_query
+    if args.command == "encoders":
+        listing = {"encoders": available_encoders(), "poolings": available_poolings()}
+        if args.json:
+            _print(listing)
+        else:
+            print("encoders:", ", ".join(listing["encoders"]))
+            print("poolings:", ", ".join(listing["poolings"]))
+        return 0
 
     database = EmbeddingDatabase(args.db)
-    _, _, _, manifest = database.load()
-    model_id = args.model or manifest["config"]["model_id"]
-    query = encode_text_query(model_id, args.query, args.device)
+    vectors, completed, _, manifest = database.load()
+    release_memmaps(vectors, completed)
+    # Query a database with the model that built it, unless told otherwise.
+    encoder_config, _ = resolve_configs(args, encoder_config_from_manifest(manifest))
+    encoder = create_encoder(encoder_config)
+    query = encoder.encode_text([args.query])[0]
     _print(database.search_vector(query, args.top_k))
     return 0

@@ -27,6 +27,8 @@ inference = [
     "transformers>=4.37,<5",
     "safetensors>=0.4",
 ]
+# Config files are JSON by default; YAML is opt-in so the core stays NumPy-only.
+yaml = ["pyyaml>=6"]
 
 [project.scripts]
 embedding-db = "embedding_db.cli:main"

@@ -1,0 +1,17 @@
+{
+  "encoder": {
+    "name": "hf-clip",
+    "model": "Searchium-ai/clip4clip-webvid150k",
+    "device": "auto",
+    "precision": "auto",
+    "pooling": "meanp"
+  },
+  "build": {
+    "frame_rate": 1.0,
+    "max_frames": 12,
+    "video_batch_size": 16,
+    "frame_batch_size": 128,
+    "decode_workers": 4,
+    "storage_dtype": "float32"
+  }
+}

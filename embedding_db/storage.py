@@ -18,6 +18,7 @@ from typing import Any
 
 import numpy as np
 
+from .config import EncoderConfig
 from .core import BuildConfig, EmbeddingDatabase, _json_dump, npy_bytes, release_memmaps
 from .pack import PACKINGS, bytes_per_vector, pack_vectors, score_matrix, unpack_vectors
 from .video import VideoItem
@@ -190,7 +191,7 @@ def import_vectors(
     ]
 
     database = EmbeddingDatabase(output_dir)
-    config = BuildConfig(model_id=model_id) if model_id else BuildConfig()
+    config = BuildConfig(encoder=EncoderConfig(model=model_id)) if model_id else BuildConfig()
     vectors, completed = database.initialize(items, config, dimension, overwrite=overwrite)
     vectors[:] = matrix
     completed[:] = True

@@ -1,4 +1,4 @@
-"""Video discovery, sampling, and CLIP preprocessing."""
+"""Video discovery, frame sampling, and encoder-driven preprocessing."""
 
 from __future__ import annotations
 
@@ -11,6 +11,8 @@ from typing import Iterable, TypeVar
 
 import numpy as np
 
+from .config import PreprocessSpec
+
 # OpenCV is imported lazily inside the decoding functions: storage, packing,
 # capacity planning and evaluation never touch a video file, and should not
 # require a video library to be installed.
@@ -19,8 +21,6 @@ T = TypeVar("T")
 
 
 VIDEO_EXTENSIONS = (".mp4", ".webm", ".mkv", ".avi", ".mov")
-CLIP_MEAN = np.asarray((0.48145466, 0.4578275, 0.40821073), dtype=np.float32)
-CLIP_STD = np.asarray((0.26862954, 0.26130258, 0.27577711), dtype=np.float32)
 
 
 @dataclass(frozen=True)
@@ -121,30 +121,43 @@ def sampled_frame_indices(frame_count: int, fps: float, frame_rate: float, max_f
     return indices
 
 
-def preprocess_bgr_frame(frame: np.ndarray, size: int = 224) -> np.ndarray:
-    """Match the CLIP resize-short-edge + center-crop preprocessing."""
+def preprocess_bgr_frame(frame: np.ndarray, spec: PreprocessSpec | None = None) -> np.ndarray:
+    """Resize and normalize one BGR frame the way the encoder asked for."""
     import cv2
 
+    spec = spec or PreprocessSpec()
     if frame is None or frame.ndim != 3 or frame.shape[2] != 3:
         raise ValueError("Expected an HxWx3 BGR frame")
+    size = spec.image_size
     rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    height, width = rgb.shape[:2]
-    scale = size / min(height, width)
-    new_height = max(size, int(round(height * scale)))
-    new_width = max(size, int(round(width * scale)))
-    resized = cv2.resize(rgb, (new_width, new_height), interpolation=cv2.INTER_CUBIC)
-    top = (new_height - size) // 2
-    left = (new_width - size) // 2
-    cropped = resized[top : top + size, left : left + size].astype(np.float32) / 255.0
-    cropped = (cropped - CLIP_MEAN) / CLIP_STD
-    return np.transpose(cropped, (2, 0, 1)).astype(np.float32, copy=False)
+
+    if spec.resize_mode == "stretch":
+        cropped = cv2.resize(rgb, (size, size), interpolation=cv2.INTER_CUBIC)
+    else:
+        height, width = rgb.shape[:2]
+        scale = size / min(height, width)
+        new_height = max(size, int(round(height * scale)))
+        new_width = max(size, int(round(width * scale)))
+        resized = cv2.resize(rgb, (new_width, new_height), interpolation=cv2.INTER_CUBIC)
+        top = (new_height - size) // 2
+        left = (new_width - size) // 2
+        cropped = resized[top : top + size, left : left + size]
+
+    values = cropped.astype(np.float32) / 255.0
+    if spec.channels == 1:
+        values = values.mean(axis=2, keepdims=True)
+    elif spec.channels != 3:
+        raise ValueError(f"Cannot produce {spec.channels} channels from an RGB frame")
+
+    values = (values - np.asarray(spec.mean, dtype=np.float32)) / np.asarray(spec.std, dtype=np.float32)
+    return np.transpose(values, (2, 0, 1)).astype(np.float32, copy=False)
 
 
 def decode_video(
     item: VideoItem,
     frame_rate: float = 1.0,
     max_frames: int = 12,
-    image_size: int = 224,
+    spec: PreprocessSpec | None = None,
 ) -> DecodeResult:
     import cv2
 
@@ -164,7 +177,7 @@ def decode_video(
             capture.set(cv2.CAP_PROP_POS_FRAMES, int(index))
             ok, frame = capture.read()
             if ok:
-                frames.append(preprocess_bgr_frame(frame, image_size))
+                frames.append(preprocess_bgr_frame(frame, spec))
         if not frames:
             return DecodeResult(None, time.perf_counter() - started, "No sampled frame could be decoded")
         return DecodeResult(np.stack(frames), time.perf_counter() - started)

@@ -38,3 +38,4 @@ jobs:
             --output-dir msrvtt_1k_db
           python -m embedding_db pack --db msrvtt_1k_db --output-dir packed_int8 --packing int8
           python -m embedding_db compare --db msrvtt_1k_db
+          python -m embedding_db encoders

@@ -14,7 +14,8 @@ retrieval in the compressed domain. Upstream's full documentation is preserved
 
 `embedding_db/` is self-contained: it depends only on NumPy for storage,
 packing, capacity planning and evaluation, and pulls in torch/transformers only
-when it has to encode something. It does not import the rest of the repository.
+when it has to encode something. It does not import the rest of the repository,
+and the model it runs is chosen through a registry rather than hardcoded.
 
 ---
 
@@ -95,8 +96,30 @@ python -m embedding_db estimate --budget 2GiB --db msrvtt_1k_db
 | `evaluate` | Text-to-video R@1 / R@5 / R@10 / MedianR (needs a 2 MB text-vector file, see [`EMBEDDING_DB.md`](EMBEDDING_DB.md#validation)) | No |
 | `search` | Text query against the database | Yes |
 | `build` | Embed raw video files into a new database | Yes |
+| `encoders` | List the registered encoder backends and poolings | No |
 
 Only the two commands that need to encode something load a checkpoint.
+
+## Configuring the model
+
+No part of the pipeline names a model. `build` and `search` construct an encoder
+through a registry, so the backend, the checkpoint (hub id **or local path**),
+the cache directory, device, precision, pooling and frame preprocessing are all
+configuration:
+
+```bash
+python -m embedding_db build --videos-dir /datasets/MSRVTT/MSRVTT_Videos --output-dir /storage/db --config configs/local-checkpoint.json
+```
+
+Settings resolve as **defaults < config file < explicit flags**, and land in
+`manifest.json` — so `search` queries a database with the model that built it,
+and `--resume` refuses to continue one under a different model or preprocessing.
+Preprocessing follows the checkpoint by default (`HFClipEncoder` reads its
+`preprocessor_config.json`) rather than assuming CLIP constants.
+
+Adding a backend is a class plus a `@register_encoder("name")` decorator, with
+no pipeline changes. See
+[`EMBEDDING_DB.md`](EMBEDDING_DB.md#choosing-and-configuring-a-model).
 
 ## Storage layout
 

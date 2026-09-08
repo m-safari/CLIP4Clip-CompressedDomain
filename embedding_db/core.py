@@ -10,7 +10,7 @@ import shutil
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
@@ -19,18 +19,48 @@ import numpy as np
 from numpy.lib import format as npy_format
 from numpy.lib.format import open_memmap
 
-from .model import Clip4ClipEncoder, mean_pool_frame_embeddings
+from .config import DEFAULT_MODEL_ID, EncoderConfig, encoder_config_from_dict
+from .encoders import FrameEncoder, create_encoder
+from .model import get_pooling
 from .pack import score_query
 from .video import VideoItem, batched, decode_video, discover_videos
 
 
-DEFAULT_MODEL_ID = "Searchium-ai/clip4clip-webvid150k"
 
 
 def _json_dump(path: Path, value: Any) -> None:
     temporary = path.with_suffix(path.suffix + ".tmp")
     temporary.write_text(json.dumps(value, ensure_ascii=False, indent=2), encoding="utf-8")
     os.replace(temporary, path)
+
+
+def _comparable_config(config: dict[str, Any]) -> dict[str, Any]:
+    """Strip the settings that describe where a build ran, not what it produced."""
+    comparable = {key: value for key, value in config.items() if key not in ("device", "precision")}
+    encoder = comparable.get("encoder")
+    if isinstance(encoder, dict):
+        comparable["encoder"] = {
+            key: value for key, value in encoder.items() if key not in ("device", "precision")
+        }
+    return comparable
+
+
+def encoder_config_from_manifest(manifest: dict[str, Any]) -> EncoderConfig:
+    """Read a manifest's encoder settings, tolerating databases built before
+    the settings were nested under `encoder`."""
+    stored = dict(manifest.get("config") or {})
+    nested = stored.get("encoder")
+    if isinstance(nested, dict):
+        return encoder_config_from_dict(nested)
+
+    legacy = {
+        "model": stored.get("model_id", DEFAULT_MODEL_ID),
+        "device": stored.get("device", "auto"),
+        "precision": stored.get("precision", "auto"),
+    }
+    if stored.get("image_size") is not None:
+        legacy["image_size"] = stored["image_size"]
+    return encoder_config_from_dict(legacy)
 
 
 def npy_bytes(count: int, dimension: int, dtype: str = "float32") -> int:
@@ -75,13 +105,12 @@ def estimate_database_size(count: int, dimension: int = 512, dtype: str = "float
 
 @dataclass
 class BuildConfig:
-    model_id: str = DEFAULT_MODEL_ID
-    device: str = "auto"
-    precision: str = "auto"
+    """Everything a build needs. Model-facing settings live under `encoder`."""
+
+    encoder: EncoderConfig = field(default_factory=EncoderConfig)
     storage_dtype: str = "float32"
     frame_rate: float = 1.0
     max_frames: int = 12
-    image_size: int = 224
     frame_batch_size: int = 128
     video_batch_size: int = 16
     decode_workers: int = 4
@@ -142,12 +171,9 @@ class EmbeddingDatabase:
             existing_items = self._read_items()
             if [(x.video_id, str(x.path)) for x in existing_items] != [(x.video_id, str(x.path)) for x in items]:
                 raise ValueError("Resume input does not match the existing database item list")
-            comparable = asdict(config)
-            comparable.pop("device", None)
-            comparable.pop("precision", None)
-            stored = dict(manifest["config"])
-            stored.pop("device", None)
-            stored.pop("precision", None)
+            # Where a build ran is not part of its identity; what it computed is.
+            comparable = _comparable_config(asdict(config))
+            stored = _comparable_config(manifest["config"])
             if comparable != stored or embedding_dim != manifest["embedding_dim"]:
                 raise ValueError("Resume configuration does not match the existing database")
             return (
@@ -214,18 +240,13 @@ class EmbeddingDatabase:
         return hits
 
 
-def _system_info(encoder: Clip4ClipEncoder) -> dict[str, Any]:
-    torch = encoder.torch
-    info: dict[str, Any] = {
+def _system_info(encoder: FrameEncoder) -> dict[str, Any]:
+    """Host facts plus whatever the encoder chooses to report about itself."""
+    return {
         "platform": platform.platform(),
         "python": sys.version.split()[0],
-        "torch": torch.__version__,
-        "device": str(encoder.device),
+        **encoder.describe(),
     }
-    if encoder.device.type == "cuda":
-        info["gpu"] = torch.cuda.get_device_name(encoder.device)
-        info["gpu_memory_bytes"] = torch.cuda.get_device_properties(encoder.device).total_memory
-    return info
 
 
 def build_database(
@@ -246,9 +267,12 @@ def build_database(
     if strict and missing:
         raise FileNotFoundError(f"{len(missing)} CSV video IDs are missing; first: {missing[:5]}")
 
+    pool_frames = get_pooling(config.encoder.pooling)
     model_started = time.perf_counter()
-    encoder = Clip4ClipEncoder(config.model_id, config.device, config.precision)
+    encoder = create_encoder(config.encoder)
     model_load_seconds = time.perf_counter() - model_started
+    # The encoder, not the decoder, decides how frames must look.
+    preprocess = encoder.preprocess
     database = EmbeddingDatabase(output_dir)
     vectors, completed = database.initialize(items, config, encoder.embedding_dim, overwrite, resume)
     failures_path = database.directory / "failures.jsonl"
@@ -264,7 +288,7 @@ def build_database(
         # to share a path can never overwrite one another's row.
         for group in batched(pending, config.video_batch_size):
             results = list(executor.map(
-                lambda pair: decode_video(pair[1], config.frame_rate, config.max_frames, config.image_size),
+                lambda pair: decode_video(pair[1], config.frame_rate, config.max_frames, preprocess),
                 group,
             ))
             attempted += len(group)
@@ -289,7 +313,7 @@ def build_database(
 
             cursor = 0
             for (row_index, _), frame_count in zip(valid, counts):
-                vectors[row_index] = mean_pool_frame_embeddings(frame_embeddings[cursor : cursor + frame_count]).astype(config.storage_dtype)
+                vectors[row_index] = pool_frames(frame_embeddings[cursor : cursor + frame_count]).astype(config.storage_dtype)
                 completed[row_index] = True
                 cursor += frame_count
                 successful += 1

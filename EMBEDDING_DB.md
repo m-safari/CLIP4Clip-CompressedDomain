@@ -140,6 +140,94 @@ python -m unittest discover -s tests -v
 
 The tests download nothing and load no checkpoint.
 
+## Choosing and configuring a model
+
+Nothing in the pipeline names a model. `build` and `search` construct an encoder
+through a registry, so which model runs, where its weights come from, and how
+frames are prepared for it are all configuration rather than code.
+
+List what is registered:
+
+```bash
+python -m embedding_db encoders
+```
+
+Every model-facing setting is available as a flag on both `build` and `search`:
+
+| Flag | Purpose |
+|---|---|
+| `--encoder` | Which backend to construct (default `hf-clip`) |
+| `--model` | Hub id **or local directory** of the checkpoint |
+| `--revision` | Pin a checkpoint revision |
+| `--cache-dir` | Where downloaded weights live |
+| `--local-files-only` | Never touch the network |
+| `--device`, `--precision` | Where and in what dtype inference runs |
+| `--pooling` | Frames-to-video reduction (default `meanp`) |
+| `--image-size`, `--image-mean`, `--image-std` | Override the preprocessing |
+
+The preprocessing flags are overrides, not defaults. Left alone, the encoder
+reports what its own checkpoint asks for — `HFClipEncoder` reads the
+checkpoint's `preprocessor_config.json` — so a model with different
+normalization is handled without editing any code. Verified for the shipped
+checkpoint: the values it declares are identical to the CLIP constants these
+results were measured with.
+
+### Config files
+
+Long command lines can move into a JSON file, and `configs/` holds two worked
+examples:
+
+```bash
+python -m embedding_db build --videos-dir /datasets/MSRVTT/MSRVTT_Videos --output-dir /storage/db --config configs/local-checkpoint.json
+```
+
+```json
+{
+  "encoder": {
+    "name": "hf-clip",
+    "model": "/storage/checkpoints/clip4clip-webvid150k",
+    "cache_dir": "/storage/hf-cache",
+    "local_files_only": true,
+    "device": "cuda",
+    "precision": "float16"
+  },
+  "build": { "max_frames": 12, "video_batch_size": 32 }
+}
+```
+
+Precedence is **defaults < config file < explicit flags**, so a checked-in file
+can define a setup and a single flag can vary one run of it. Unknown keys are
+rejected rather than ignored, because a silently dropped setting is one the user
+believes is applied. YAML works too if PyYAML is installed
+(`pip install msrvtt-embedding-db[yaml]`); JSON needs nothing.
+
+The resolved settings are recorded in `manifest.json`, which means `search`
+queries a database with the model that built it without being told, and
+`--resume` refuses to continue a database under a different model, pooling or
+preprocessing.
+
+### Adding a backend
+
+Implement `embed_frames`, `synchronize`, `describe`, a `preprocess`
+`PreprocessSpec` and an `embedding_dim`, then register it:
+
+```python
+from embedding_db import PreprocessSpec, register_encoder
+
+@register_encoder("my-model")
+class MyEncoder:
+    def __init__(self, config):
+        self.embedding_dim = 512
+        self.preprocess = config.apply_overrides(PreprocessSpec(image_size=224))
+    def embed_frames(self, frames, batch_size=128): ...
+    def synchronize(self): ...
+    def describe(self): return {"encoder": "my-model"}
+```
+
+`--encoder my-model` then works everywhere, with no changes to the pipeline. The
+test suite uses exactly this to exercise a full `build` with no model, no
+checkpoint and no video decoding.
+
 ## Building from raw video
 
 To embed videos yourself rather than importing published vectors:
@@ -166,9 +254,10 @@ timed.
 python -m embedding_db search --db msrvtt_1k_db --query "a person is playing guitar" --top-k 10
 ```
 
-This is the only command that loads a model, because the query text has to be
-encoded. It works against any packing, and it loads the cached safetensors
-weights, so no second copy of the checkpoint is downloaded.
+This is the only query-side command that loads a model, because the text has to
+be encoded. It works against any packing, and reconstructs its encoder from the
+database's manifest, so a database is queried with the model that built it. Any
+of the model flags above override that for one run.
 
 One caveat with the imported database: its visual vectors come from the
 MSR-VTT-9k checkpoint, while `--model` defaults to the `webvid150k` text
