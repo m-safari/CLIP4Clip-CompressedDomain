@@ -8,9 +8,9 @@ retrieval in the compressed domain. Upstream's full documentation is preserved
 
 | Component | Purpose |
 |---|---|
-| [`compressed_domain/`](compressed_domain/) | Motion-vector and residual encoders — in development |
+| [`compressed_domain/`](compressed_domain/) | Compressed-domain dataloader and the three-stream `CLIP4ClipCompressed` model (I-frame, residual, motion vector) |
 | [`embedding_db/`](embedding_db/) | Turns an MSR-VTT sample into a portable vector database, with capacity planning and vector packing |
-| `modules/`, `dataloaders/`, `main_task_retrieval.py` | Upstream CLIP4Clip training and evaluation, unchanged |
+| `modules/`, `dataloaders/`, `main_task_retrieval.py` | CLIP4Clip training and evaluation, carried over from upstream |
 
 `embedding_db/` is self-contained: it depends only on NumPy for storage,
 packing, capacity planning and evaluation, and pulls in torch/transformers only
