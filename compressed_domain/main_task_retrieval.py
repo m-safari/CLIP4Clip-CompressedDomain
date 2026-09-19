@@ -336,7 +336,7 @@ def main():
     # train and eval
     ## ####################################
     if args.do_train:
-        train_dataloader, train_length, _ = DATALOADER_DICT[DATATYPE]["train"](args, tokenizer)
+        train_dataloader, train_length = DATALOADER_DICT[DATATYPE]["train"](args, tokenizer)
         num_train_optimization_steps = (int(len(train_dataloader) + args.gradient_accumulation_steps - 1)
                                         / args.gradient_accumulation_steps) * args.epochs
 

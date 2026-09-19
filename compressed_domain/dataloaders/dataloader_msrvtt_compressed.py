@@ -61,8 +61,8 @@ class MSRVTT_Compressed_DataLoader(Dataset):
         # These are intentionally independent.
         # ---------------------------------------------------------------
         max_iframe_length=100,
-        max_residual_length=300,
-        max_mv_length=300,
+        max_residual_length=100,
+        max_mv_length=100,
 
         # ---------------------------------------------------------------
         # Spatial resolution.

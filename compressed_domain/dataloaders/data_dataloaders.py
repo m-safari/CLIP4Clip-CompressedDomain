@@ -16,7 +16,7 @@ def dataloader_msrvtt_train(args, tokenizer):
         msrvtt_dataset,
         batch_size=args.batch_size,
         pin_memory=False,
-        shuffle=(train_sampler is None),
+        # shuffle=(train_sampler is None), # TODO restore this param
         drop_last=True,
     )
 
@@ -36,7 +36,7 @@ def dataloader_msrvtt_test(args, tokenizer):
         msrvtt_dataset,
         batch_size=args.batch_size,
         pin_memory=False,
-        shuffle=(train_sampler is None),
+        # shuffle=(train_sampler is None), # TODO restore this param
         drop_last=True,
     )
 
@@ -44,4 +44,4 @@ def dataloader_msrvtt_test(args, tokenizer):
 
 
 DATALOADER_DICT = {}
-DATALOADER_DICT["msrvtt"] = {"train":dataloader_msrvtt_train, "val":dataloader_msrvtt_test, "test":None}
+DATALOADER_DICT["msrvtt"] = {"train":dataloader_msrvtt_train, "test":dataloader_msrvtt_test, "val":None}

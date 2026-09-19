@@ -14,6 +14,18 @@ from modules.module_clip import CLIP, VisualTransformer, convert_weights
 logger = logging.getLogger(__name__)
 
 
+class _EmptyConfig(PretrainedConfig):
+    """
+    Placeholder config. `until_module.PreTrainedModel.__init__` requires a
+    `PretrainedConfig` instance, and `init_weights` reads `initializer_range`
+    off it for Linear/Embedding init. Nothing else in this model touches the
+    config, so this is hardcoded to CLIP4Clip's standard value rather than
+    threaded through as a real option — revisit if/when you want it tunable.
+    """
+    def __init__(self):
+        self.initializer_range = 0.02
+
+
 class CLIP4ClipPreTrainedModel(PreTrainedModel, nn.Module):
     """
     Thin base class providing the weight-loading plumbing (`init_weights`,
@@ -51,7 +63,7 @@ class CLIP4ClipPreTrainedModel(PreTrainedModel, nn.Module):
         # its 2-channel (dx, dy) input has no correspondence to RGB, so warm-starting
         # it from CLIP's RGB conv1 filters would be a speculative, ungrounded choice.
 
-        config = PretrainedConfig.from_dict({})
+        config = _EmptyConfig()
         model = cls(config, clip_state_dict, task_config)
         model = cls.init_preweight(model, state_dict, task_config=task_config)
         return model
@@ -165,10 +177,14 @@ class CLIP4ClipCompressed(CLIP4ClipPreTrainedModel):
         CLIP.encode_image's post-processing (ln_post -> proj -> take CLS token),
         generalized to any VisualTransformer instance.
 
-        frames: (B, T, C, H, W)  ->  returns (B, T, embed_dim)
+        frames: (..., T, C, H, W) -- any number of leading dims (batch, n_pair, ...)
+        are flattened into one batch dim, the same way get_sequence_output flattens
+        text's leading dims via .view(-1, last_dim).
+        Returns (B_flat, T, embed_dim).
         """
+        frames = frames.contiguous().view(-1, *frames.shape[-4:])
         b, t, c, h, w = frames.shape
-        frames = frames.contiguous().view(b * t, c, h, w)
+        frames = frames.view(b * t, c, h, w)
         frames = frames.type(encoder.conv1.weight.dtype)
 
         hidden = encoder(frames, video_frame=video_frame)          # (B*T, tokens, width)
@@ -178,9 +194,15 @@ class CLIP4ClipCompressed(CLIP4ClipPreTrainedModel):
         return cls
 
     def get_visual_output(self, iframe, iframe_mask, residuals, residuals_mask, mv, mv_mask):
-        iframe_feat = self._encode_modality(self.clip.visual, iframe, iframe.shape[1])
-        residual_feat = self._encode_modality(self.residual_encoder, residuals, residuals.shape[1])
-        mv_feat = self._encode_modality(self.mv_encoder, mv, mv.shape[1])
+        # Masks get the same leading-dim flattening as their frame tensors so the
+        # two stay aligned (e.g. (B, n_pair, T) -> (B*n_pair, T)).
+        iframe_mask = iframe_mask.contiguous().view(-1, iframe_mask.shape[-1])
+        residuals_mask = residuals_mask.contiguous().view(-1, residuals_mask.shape[-1])
+        mv_mask = mv_mask.contiguous().view(-1, mv_mask.shape[-1])
+
+        iframe_feat = self._encode_modality(self.clip.visual, iframe, iframe.shape[-4])
+        residual_feat = self._encode_modality(self.residual_encoder, residuals, residuals.shape[-4])
+        mv_feat = self._encode_modality(self.mv_encoder, mv, mv.shape[-4])
 
         # All frames from all three modalities become one pooled set of "frames",
         # the same way CLIP4Clip already pools frames within a single modality.
