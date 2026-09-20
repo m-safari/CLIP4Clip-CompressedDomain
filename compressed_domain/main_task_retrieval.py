@@ -304,14 +304,14 @@ def main():
     assert -1 <= args.freeze_layer_num <= 12
     if args.freeze_layer_num > -1:
         for name, param in model.clip.named_parameters():
-            if name.find("ln_final.") == 0 or name.find("text_projection") == 0 or name.find("logit_scale") == 0 \
-                    or name.find("visual.ln_post.") == 0 or name.find("visual.proj") == 0:
-                continue
-            elif name.find("visual.transformer.resblocks.") == 0 or name.find("transformer.resblocks.") == 0:
+            if name.find("visual.transformer.resblocks.") == 0 or name.find("transformer.resblocks.") == 0:
                 layer_num = int(name.split(".resblocks.")[1].split(".")[0])
-                if layer_num >= args.freeze_layer_num:
-                    continue
-            param.requires_grad = False
+                if layer_num < args.freeze_layer_num:
+                    param.requires_grad = False
+            # Everything else (token/positional embeddings, visual.conv1,
+            # visual.class_embedding, ln_final, proj, logit_scale, ...) stays
+            # trainable by default -- only numbered resblocks below the
+            # threshold get frozen.
 
     ## ####################################
     # MSRVTT dataloaders
@@ -337,6 +337,29 @@ def main():
     ## ####################################
     if args.do_train:
         train_dataloader, train_length = DATALOADER_DICT[DATATYPE]["train"](args, tokenizer)
+
+        # --- Shrink training set to fit a 6-hour session ---
+        # From the last log: ~1.7s/step at batch_size=2 -> the full 180k-example
+        # set is ~90,000 steps/epoch -> ~42 hours for ONE epoch. Not viable.
+        # This subsets the already-constructed dataset (no dataloader/collate
+        # changes) so 5 epochs fit in roughly 5 hours, leaving an hour of
+        # headroom for eval passes + checkpoint writes.
+        # 5h budget / 5 epochs / 1.7s per step * batch_size=2 examples/step =~ 4200
+        TRAIN_SUBSET_SIZE = 4000
+        if TRAIN_SUBSET_SIZE < train_length:
+            subset_indices = list(range(TRAIN_SUBSET_SIZE))
+            train_dataloader = torch.utils.data.DataLoader(
+                torch.utils.data.Subset(train_dataloader.dataset, subset_indices),
+                batch_size=train_dataloader.batch_size,
+                shuffle=True,
+                num_workers=train_dataloader.num_workers,
+                collate_fn=train_dataloader.collate_fn,
+                pin_memory=train_dataloader.pin_memory,
+                drop_last=train_dataloader.drop_last,
+            )
+            train_length = TRAIN_SUBSET_SIZE
+            logger.info("Shrunk training set to %d examples for this session", train_length)
+
         num_train_optimization_steps = (int(len(train_dataloader) + args.gradient_accumulation_steps - 1)
                                         / args.gradient_accumulation_steps) * args.epochs
 
