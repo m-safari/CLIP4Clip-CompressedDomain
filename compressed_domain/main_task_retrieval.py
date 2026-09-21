@@ -345,7 +345,7 @@ def main():
         # changes) so 5 epochs fit in roughly 5 hours, leaving an hour of
         # headroom for eval passes + checkpoint writes.
         # 5h budget / 5 epochs / 1.7s per step * batch_size=2 examples/step =~ 4200
-        TRAIN_SUBSET_SIZE = 4000
+        TRAIN_SUBSET_SIZE = 8000
         if TRAIN_SUBSET_SIZE < train_length:
             subset_indices = list(range(TRAIN_SUBSET_SIZE))
             train_dataloader = torch.utils.data.DataLoader(
