@@ -1,2 +1,11 @@
 .git
 .idea
+.gitignore
+.Trash-0/
+.ipynb_checkpoints/
+compressed_domain/env
+compressed_domain/db
+./modules
+./preprocess
+./dataloaders
+*.pyc
