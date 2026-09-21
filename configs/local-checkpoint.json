@@ -1,0 +1,14 @@
+{
+  "encoder": {
+    "name": "hf-clip",
+    "model": "/storage/checkpoints/clip4clip-webvid150k",
+    "cache_dir": "/storage/hf-cache",
+    "local_files_only": true,
+    "device": "cuda",
+    "precision": "float16"
+  },
+  "build": {
+    "max_frames": 12,
+    "video_batch_size": 32
+  }
+}
