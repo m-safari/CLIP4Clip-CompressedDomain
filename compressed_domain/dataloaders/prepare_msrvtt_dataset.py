@@ -3,6 +3,7 @@ import subprocess
 import kagglehub
 import shutil
 from pathlib import Path
+import argparse
 import json
 import csv
 from zipfile import ZipFile
@@ -130,3 +131,21 @@ def caption_json_to_csv(input_path, output_path):
     # Writing data of CSV file
         cw.writerow(emp.values())
     df.close()
+######################################################################## 
+    
+       
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        description="Download and prepare the MSRVTT dataset."
+    )
+
+    parser.add_argument(
+        "--download-path",
+        type=Path,
+        default=DEFAULT_DOWNLOAD_PATH,
+        help=f"Dataset download directory (default: {DEFAULT_DOWNLOAD_PATH})",
+    )
+
+    args = parser.parse_args()
+
+    prepare_msrvtt_dataset(args.download_path)
