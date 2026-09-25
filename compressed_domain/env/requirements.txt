@@ -1,0 +1,14 @@
+--extra-index-url https://download.pytorch.org/whl/cu126
+torch==2.9.0+cu126
+torchvision
+ftfy
+regex
+tqdm
+opencv-python
+boto3
+requests
+pandas
+transformers
+kagglehub
+matplotlib
+mlflow
