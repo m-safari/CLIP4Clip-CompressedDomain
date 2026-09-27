@@ -2,7 +2,7 @@ name: tests
 
 on:
   push:
-    branches: [master, main, embedding-db]
+    branches: [master, main, dev, embedding-db]
   pull_request:
 
 jobs:
@@ -12,6 +12,13 @@ jobs:
       fail-fast: false
       matrix:
         python-version: ["3.10", "3.12"]
+
+    # The embedding database lives under compressed_domain/evaluate/, and its
+    # package, tests and sample data are all addressed relative to that
+    # directory rather than to the repository root.
+    defaults:
+      run:
+        working-directory: compressed_domain/evaluate
 
     steps:
       - uses: actions/checkout@v4

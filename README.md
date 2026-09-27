@@ -9,8 +9,8 @@ retrieval in the compressed domain. Upstream's full documentation is preserved
 | Component | Purpose |
 |---|---|
 | [`compressed_domain/`](compressed_domain/) | Compressed-domain dataloader and the three-stream `CLIP4ClipCompressed` model (I-frame, residual, motion vector) |
-| [`embedding_db/`](embedding_db/) | Turns an MSR-VTT sample into a portable vector database, with capacity planning and vector packing |
-| `modules/`, `dataloaders/`, `main_task_retrieval.py` | CLIP4Clip training and evaluation, carried over from upstream |
+| [`compressed_domain/evaluate/`](compressed_domain/evaluate/) | Turns an MSR-VTT sample into a portable vector database, with capacity planning and vector packing |
+| [`rgb_domain/`](rgb_domain/) | CLIP4Clip training and evaluation, carried over from upstream |
 
 `embedding_db/` is self-contained: it depends only on NumPy for storage,
 packing, capacity planning and evaluation, and pulls in torch/transformers only
@@ -30,6 +30,14 @@ The shipped database is real — 1,000 MSR-VTT test videos with captions, scorin
 CLIP4Clip meanP figure for MSR-VTT-9k.
 
 ## Quickstart
+
+Every command below, up to the [upstream section](#upstream-clip4clip), runs from
+`compressed_domain/evaluate/` — where the package, its tests and the sample data
+live:
+
+```bash
+cd compressed_domain/evaluate
+```
 
 ```bash
 pip install -r requirements-embedding.txt
@@ -93,7 +101,7 @@ python -m embedding_db estimate --budget 2GiB --db msrvtt_1k_db
 | `import-vectors` | Turn a vector matrix plus a split CSV into a database | No |
 | `pack` | Rewrite a database as float16, int8, or binary | No |
 | `compare` | Score every packing against the stored float32 vectors | No |
-| `evaluate` | Text-to-video R@1 / R@5 / R@10 / MedianR (needs a 2 MB text-vector file, see [`EMBEDDING_DB.md`](EMBEDDING_DB.md#validation)) | No |
+| `evaluate` | Text-to-video R@1 / R@5 / R@10 / MedianR (needs a 2 MB text-vector file, see [`EMBEDDING_DB.md`](compressed_domain/evaluate/EMBEDDING_DB.md#validation)) | No |
 | `search` | Text query against the database | Yes |
 | `build` | Embed raw video files into a new database | Yes |
 | `encoders` | List the registered encoder backends and poolings | No |
@@ -119,7 +127,7 @@ Preprocessing follows the checkpoint by default (`HFClipEncoder` reads its
 
 Adding a backend is a class plus a `@register_encoder("name")` decorator, with
 no pipeline changes. See
-[`EMBEDDING_DB.md`](EMBEDDING_DB.md#choosing-and-configuring-a-model).
+[`EMBEDDING_DB.md`](compressed_domain/evaluate/EMBEDDING_DB.md#choosing-and-configuring-a-model).
 
 ## Storage layout
 
@@ -152,7 +160,7 @@ mirrors all 10,000 clips) and the checkpoint another 605 MB, neither of which is
 copied into the database.
 
 Timing for this path has **not** been measured end to end — see
-[`BENCHMARK_RESULTS.md`](BENCHMARK_RESULTS.md) for exactly what was and was not
+[`BENCHMARK_RESULTS.md`](compressed_domain/evaluate/BENCHMARK_RESULTS.md) for exactly what was and was not
 measured.
 
 ## Tests
@@ -161,13 +169,13 @@ measured.
 python -m unittest discover -s tests -v
 ```
 
-29 tests. They download nothing and load no checkpoint.
+56 tests. They download nothing and load no checkpoint.
 
 ## Further reading
 
-- [`EMBEDDING_DB.md`](EMBEDDING_DB.md) — full module documentation
-- [`BENCHMARK_RESULTS.md`](BENCHMARK_RESULTS.md) — measurements, and the limits of each
-- [`sample_database/`](sample_database/) — the published vectors and split CSV
+- [`EMBEDDING_DB.md`](compressed_domain/evaluate/EMBEDDING_DB.md) — full module documentation
+- [`BENCHMARK_RESULTS.md`](compressed_domain/evaluate/BENCHMARK_RESULTS.md) — measurements, and the limits of each
+- [`sample_database/`](compressed_domain/evaluate/sample_database/) — the published vectors and split CSV
 
 ---
 
@@ -188,7 +196,7 @@ The implementation of paper [**CLIP4Clip: An Empirical Study of CLIP for End to 
 
 CLIP4Clip is a video-text retrieval model based on [CLIP (ViT-B)](https://github.com/openai/CLIP). We investigate three similarity calculation approaches: parameter-free type, sequential type, and tight type, in this work. The model achieve SOTA results on MSR-VTT, MSVD, LSMDC, ActivityNet, and DiDeMo.
 
-![CLIP4Clip](CLIP4Clip.png)
+![CLIP4Clip](rgb_domain/CLIP4Clip.png)
 
 ## Requirement
 ```sh
@@ -226,7 +234,7 @@ wget https://github.com/ArrowLuo/CLIP4Clip/releases/download/v0.0/msvd_data.zip
 **For LSMDC**
 
 You must obtain permission from MPII to download and use the data. The download link is [here](https://sites.google.com/site/describingmovies/download).
-The 1000 test clips data is [link](http://www.google.com/url?q=http%3A%2F%2Fdatasets.d2.mpi-inf.mpg.de%2FmovieDescription%2Fprotected%2Flsmdc2016%2FLSMDC16_challenge_1000_publictect.csv&sa=D&sntz=1&usg=AFQjCNGIaGVhCeb6zNfUs2UL1zNzoEtaSg). Read our paper and the [dataloader](./dataloaders/dataloader_lsmdc_retrieval.py) for more information.
+The 1000 test clips data is [link](http://www.google.com/url?q=http%3A%2F%2Fdatasets.d2.mpi-inf.mpg.de%2FmovieDescription%2Fprotected%2Flsmdc2016%2FLSMDC16_challenge_1000_publictect.csv&sa=D&sntz=1&usg=AFQjCNGIaGVhCeb6zNfUs2UL1zNzoEtaSg). Read our paper and the [dataloader](rgb_domain/dataloaders/dataloader_lsmdc_retrieval.py) for more information.
 
 **For ActivityNet**
 
@@ -377,10 +385,10 @@ Our code is based on [CLIP](https://github.com/openai/CLIP) and [UniVL](https://
 # License and attribution
 
 MIT, inherited from upstream CLIP4Clip (Copyright (c) 2021 ArrowLuo) — see
-[`LICENSE`](LICENSE). Code added in this repository is released under the same
+[`LICENSE`](rgb_domain/LICENSE). Code added in this repository is released under the same
 terms.
 
-The vectors in [`sample_database/`](sample_database/) are published by
+The vectors in [`sample_database/`](compressed_domain/evaluate/sample_database/) are published by
 [Searchium-ai/clip4clip-webvid150k](https://huggingface.co/Searchium-ai/clip4clip-webvid150k)
 and the split CSV comes from the CLIP4Clip release data; both are redistributed
 here for reproducibility, not authored by this repository.

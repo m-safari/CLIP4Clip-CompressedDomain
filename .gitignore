@@ -1,0 +1,25 @@
+.idea/
+.Trash-0/
+.ipynb_checkpoints/
+
+# Environment configs under compressed_domain/env/ are tracked on purpose;
+# only the local database scratch directory is ignored.
+compressed_domain/db/
+
+# Python
+*.py[cod]
+__pycache__/
+*.egg-info/
+build/
+dist/
+.venv/
+
+# Artifacts written by the embedding_db test suite and CI smoke test
+tests/work-*/
+msrvtt_1k_db*/
+packed_*/
+embedding-output/
+benchmark_model/
+benchmark_output*/
+benchmark_videos/
+features/
