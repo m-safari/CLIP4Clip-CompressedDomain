@@ -8,7 +8,9 @@ version = "0.1.0"
 description = "Compact, file-backed MSR-VTT video embedding database with capacity planning and vector packing"
 readme = "EMBEDDING_DB.md"
 requires-python = ">=3.10"
-license = { file = "LICENSE" }
+# Stated inline rather than as a file reference: the LICENSE this inherits from
+# lives at the repository root's rgb_domain/LICENSE, outside this package.
+license = { text = "MIT" }
 keywords = ["video-retrieval", "clip4clip", "embeddings", "msr-vtt", "vector-database"]
 classifiers = [
     "Programming Language :: Python :: 3",
