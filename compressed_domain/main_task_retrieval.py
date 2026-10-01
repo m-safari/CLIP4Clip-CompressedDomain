@@ -7,6 +7,7 @@ import torch
 import numpy as np
 import random
 import os
+import mlflow
 from metrics import compute_metrics
 import time
 import argparse
@@ -16,6 +17,7 @@ from modules.optimization import BertAdam
 
 from util import get_logger
 from dataloaders.data_dataloaders import DATALOADER_DICT
+TRAIN_SUBSET_SIZE = 2000
 
 global logger
 
@@ -23,7 +25,7 @@ global logger
 # All torch.distributed / DistributedDataParallel and multi-dataset
 # selection logic from the original has been removed.
 DATATYPE = "msrvtt"
-
+MLFLOW_EXPERIMENT_NAME = "clip4clip-compressed-domain"
 
 def get_args(description='CLIP4Clip on Retrieval Task (single-GPU, MSRVTT)'):
     parser = argparse.ArgumentParser(description=description)
@@ -221,6 +223,7 @@ def train_epoch(epoch, args, model, train_dataloader, device, optimizer, global_
                             len(train_dataloader), "-".join([str('%.9f' % itm) for itm in sorted(list(set(optimizer.get_lr())))]),
                             float(loss),
                             (time.time() - start_time) / (log_step * args.gradient_accumulation_steps))
+                mlflow.log_metric("train_loss", float(loss), step=global_step)
                 start_time = time.time()
 
     total_loss = total_loss / len(train_dataloader)
@@ -242,7 +245,7 @@ def _compute_sim_matrix(model, batch_list_t, batch_list_v, batch_sequence_output
     return sim_matrix
 
 
-def eval_epoch(args, model, test_dataloader, device):
+def eval_epoch(args, model, test_dataloader, device, epoch=None):
     model = model.to(device)
     model.eval()
 
@@ -281,6 +284,18 @@ def eval_epoch(args, model, test_dataloader, device):
     logger.info("Video-to-Text:")
     logger.info('\t>>>  V2T$R@1: {:.1f} - V2T$R@5: {:.1f} - V2T$R@10: {:.1f} - V2T$Median R: {:.1f} - V2T$Mean R: {:.1f}'.
                 format(vt_metrics['R1'], vt_metrics['R5'], vt_metrics['R10'], vt_metrics['MR'], vt_metrics['MeanR']))
+    
+    mlflow.log_metrics({
+        "val_t2v_R1": tv_metrics['R1'],
+        "val_t2v_R5": tv_metrics['R5'],
+        "val_t2v_R10": tv_metrics['R10'],
+        "val_t2v_MedianR": tv_metrics['MR'],
+        "val_t2v_MeanR": tv_metrics['MeanR'],
+        "val_v2t_R1": vt_metrics['R1'],
+        "val_v2t_R5": vt_metrics['R5'],
+        "val_v2t_R10": vt_metrics['R10'],
+    }, step=epoch if epoch is not None else 0)
+ 
 
     return tv_metrics['R1']
 
@@ -289,6 +304,13 @@ def main():
     global logger
     args = get_args()
     args = set_seed_logger(args)
+    
+    mlflow.set_tracking_uri("sqlite:///" + os.path.join(args.output_dir, "mlflow.db"))
+    mlflow.set_experiment(MLFLOW_EXPERIMENT_NAME)
+    mlflow.start_run(run_name=os.path.basename(os.path.normpath(args.output_dir)))
+    mlflow.log_params(vars(args))
+ 
+
     device = init_device()
 
     tokenizer = ClipTokenizer()
@@ -345,7 +367,6 @@ def main():
         # changes) so 5 epochs fit in roughly 5 hours, leaving an hour of
         # headroom for eval passes + checkpoint writes.
         # 5h budget / 5 epochs / 1.7s per step * batch_size=2 examples/step =~ 4200
-        TRAIN_SUBSET_SIZE = 8000
         if TRAIN_SUBSET_SIZE < train_length:
             subset_indices = list(range(TRAIN_SUBSET_SIZE))
             train_dataloader = torch.utils.data.DataLoader(
@@ -386,7 +407,7 @@ def main():
 
             output_model_file = save_model(epoch, args, model, optimizer, tr_loss, type_name="")
 
-            R1 = eval_epoch(args, model, test_dataloader, device)
+            R1 = eval_epoch(args, model, test_dataloader, device, epoch=epoch)
             if best_score <= R1:
                 best_score = R1
                 best_output_model_file = output_model_file
@@ -395,6 +416,7 @@ def main():
     elif args.do_eval:
         eval_epoch(args, model, test_dataloader, device)
 
+    mlflow.end_run()   
 
 if __name__ == "__main__":
     main()
