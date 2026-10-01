@@ -446,6 +446,11 @@ class CLIP(nn.Module):
 
     @property
     def dtype(self):
+        # The visual tower may be dropped (a text-only CLIP, see
+        # modeling.CLIP4ClipCompressed); convert_weights casts the text
+        # projection to the same precision as the visual weights.
+        if self.visual is None:
+            return self.text_projection.dtype
         return self.visual.conv1.weight.dtype
 
     def encode_image(self, image, return_hidden=False, video_frame=-1):
