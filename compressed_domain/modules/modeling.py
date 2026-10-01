@@ -13,6 +13,35 @@ from modules.module_clip import CLIP, VisualTransformer, convert_weights
 
 logger = logging.getLogger(__name__)
 
+# The visual branches a CLIP4ClipCompressed can be built with, in the order their
+# frame embeddings are concatenated before pooling.
+VISUAL_BRANCHES = ("iframe", "residual", "mv")
+
+
+def resolve_visual_branches(task_config):
+    """
+    Which visual branches to build, read from `task_config.visual_branches`.
+
+    Absent or None means all three, so every existing caller keeps the full model.
+    Any non-empty subset is allowed -- that is how ablated variants are built, e.g.
+    ("residual", "mv") for a model with no I-frame tower at all. Returned in
+    VISUAL_BRANCHES order, whatever order they were requested in.
+    """
+    requested = getattr(task_config, "visual_branches", None)
+    if requested is None:
+        return VISUAL_BRANCHES
+    if isinstance(requested, str):
+        requested = [requested]
+    requested = list(requested)
+    if not requested:
+        raise ValueError("visual_branches must name at least one of {}".format(VISUAL_BRANCHES))
+    unknown = sorted(set(requested) - set(VISUAL_BRANCHES))
+    if unknown:
+        raise ValueError("Unknown visual_branches {}; valid branches are {}".format(unknown, VISUAL_BRANCHES))
+    if len(set(requested)) != len(requested):
+        raise ValueError("visual_branches has duplicates: {}".format(requested))
+    return tuple(branch for branch in VISUAL_BRANCHES if branch in requested)
+
 
 class _EmptyConfig(PretrainedConfig):
     """
@@ -53,11 +82,12 @@ class CLIP4ClipPreTrainedModel(PreTrainedModel, nn.Module):
 
         # Residual branch: same 3-channel, 224x224 input shape as I-frames, so the
         # pretrained CLIP visual weights transfer directly (shape-for-shape).
-        for key, val in clip_state_dict.items():
-            if key.startswith("visual."):
-                new_key = "residual_encoder." + key[len("visual."):]
-                if new_key not in state_dict:
-                    state_dict[new_key] = val.clone()
+        if "residual" in resolve_visual_branches(task_config):
+            for key, val in clip_state_dict.items():
+                if key.startswith("visual."):
+                    new_key = "residual_encoder." + key[len("visual."):]
+                    if new_key not in state_dict:
+                        state_dict[new_key] = val.clone()
 
         # Motion-vector branch is intentionally left with its random initialization:
         # its 2-channel (dx, dy) input has no correspondence to RGB, so warm-starting
@@ -86,6 +116,11 @@ class CLIP4ClipCompressed(CLIP4ClipPreTrainedModel):
 
     Similarity: loose (cosine) similarity only. No tight/cross-attention path.
     Loss: CrossEn (the same symmetric contrastive loss as stock CLIP4Clip).
+
+    Ablation: `task_config.visual_branches` (see resolve_visual_branches) builds
+    any non-empty subset of the three encoders. A dropped branch has no weights at
+    all; its frames are still accepted (and ignored) by forward() and
+    get_visual_output(), so the dataloader and training/eval loops need no changes.
 
     Assumes the dataloader already yields tensors shaped:
         input_ids / attention_mask / token_type_ids : (B, L)
@@ -126,31 +161,41 @@ class CLIP4ClipCompressed(CLIP4ClipPreTrainedModel):
         show_log(task_config, "transformer_width: {}".format(transformer_width))
         show_log(task_config, "transformer_layers: {}".format(transformer_layers))
 
+        self.visual_branches = resolve_visual_branches(task_config)
+        show_log(task_config, "visual_branches: {}".format(", ".join(self.visual_branches)))
+
         # --- Text encoder + I-frame visual encoder: stock CLIP ---
         self.clip = CLIP(
             embed_dim, image_resolution, vision_layers, vision_width, vision_patch_size,
             context_length, vocab_size, transformer_width, transformer_heads, transformer_layers,
             linear_patch='2d',
         ).float()
+        if "iframe" not in self.visual_branches:
+            # The text encoder lives in the same CLIP module, so only its visual tower is cut.
+            self.clip.visual = None
         convert_weights(self.clip)
 
         vision_heads = vision_width // 64
 
         # --- Residual encoder: same architecture/channels as I-frame branch, own weights ---
-        self.residual_encoder = VisualTransformer(
-            input_resolution=image_resolution, patch_size=vision_patch_size, width=vision_width,
-            layers=vision_layers, heads=vision_heads, output_dim=embed_dim,
-            linear_patch='2d', input_channels=3,
-        ).float()
-        convert_weights(self.residual_encoder)
+        self.residual_encoder = None
+        if "residual" in self.visual_branches:
+            self.residual_encoder = VisualTransformer(
+                input_resolution=image_resolution, patch_size=vision_patch_size, width=vision_width,
+                layers=vision_layers, heads=vision_heads, output_dim=embed_dim,
+                linear_patch='2d', input_channels=3,
+            ).float()
+            convert_weights(self.residual_encoder)
 
         # --- Motion-vector encoder: 2-channel (dx, dy) input, trained from scratch ---
-        self.mv_encoder = VisualTransformer(
-            input_resolution=image_resolution, patch_size=vision_patch_size, width=vision_width,
-            layers=vision_layers, heads=vision_heads, output_dim=embed_dim,
-            linear_patch='2d', input_channels=2,
-        ).float()
-        convert_weights(self.mv_encoder)
+        self.mv_encoder = None
+        if "mv" in self.visual_branches:
+            self.mv_encoder = VisualTransformer(
+                input_resolution=image_resolution, patch_size=vision_patch_size, width=vision_width,
+                layers=vision_layers, heads=vision_heads, output_dim=embed_dim,
+                linear_patch='2d', input_channels=2,
+            ).float()
+            convert_weights(self.mv_encoder)
 
         self.loss_fct = CrossEn()
 
@@ -194,20 +239,26 @@ class CLIP4ClipCompressed(CLIP4ClipPreTrainedModel):
         return cls
 
     def get_visual_output(self, iframe, iframe_mask, residuals, residuals_mask, mv, mv_mask):
-        # Masks get the same leading-dim flattening as their frame tensors so the
-        # two stay aligned (e.g. (B, n_pair, T) -> (B*n_pair, T)).
-        iframe_mask = iframe_mask.contiguous().view(-1, iframe_mask.shape[-1])
-        residuals_mask = residuals_mask.contiguous().view(-1, residuals_mask.shape[-1])
-        mv_mask = mv_mask.contiguous().view(-1, mv_mask.shape[-1])
+        # Every modality is always passed in; only the branches this model was
+        # built with are encoded. A dropped branch's frames are ignored.
+        inputs = {
+            "iframe": (self.clip.visual, iframe, iframe_mask),
+            "residual": (self.residual_encoder, residuals, residuals_mask),
+            "mv": (self.mv_encoder, mv, mv_mask),
+        }
 
-        iframe_feat = self._encode_modality(self.clip.visual, iframe, iframe.shape[-4])
-        residual_feat = self._encode_modality(self.residual_encoder, residuals, residuals.shape[-4])
-        mv_feat = self._encode_modality(self.mv_encoder, mv, mv.shape[-4])
+        features, masks = [], []
+        for branch in self.visual_branches:
+            encoder, frames, mask = inputs[branch]
+            features.append(self._encode_modality(encoder, frames, frames.shape[-4]))
+            # Masks get the same leading-dim flattening as their frame tensors so the
+            # two stay aligned (e.g. (B, n_pair, T) -> (B*n_pair, T)).
+            masks.append(mask.contiguous().view(-1, mask.shape[-1]))
 
-        # All frames from all three modalities become one pooled set of "frames",
+        # All frames from all built modalities become one pooled set of "frames",
         # the same way CLIP4Clip already pools frames within a single modality.
-        visual_output = torch.cat([iframe_feat, residual_feat, mv_feat], dim=1)   # (B, T_total, D)
-        video_mask = torch.cat([iframe_mask, residuals_mask, mv_mask], dim=1)      # (B, T_total)
+        visual_output = torch.cat(features, dim=1)   # (B, T_total, D)
+        video_mask = torch.cat(masks, dim=1)         # (B, T_total)
         return visual_output, video_mask
 
     def get_sequence_visual_output(self, input_ids, token_type_ids, attention_mask,

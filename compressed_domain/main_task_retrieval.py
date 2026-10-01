@@ -12,7 +12,7 @@ from metrics import compute_metrics
 import time
 import argparse
 from modules.tokenization_clip import SimpleTokenizer as ClipTokenizer
-from modules.modeling import CLIP4ClipCompressed
+from modules.modeling import CLIP4ClipCompressed, VISUAL_BRANCHES
 from modules.optimization import BertAdam
 
 from util import get_logger
@@ -75,6 +75,8 @@ def get_args(description='CLIP4Clip on Retrieval Task (single-GPU, MSRVTT)'):
     parser.add_argument('--freeze_layer_num', type=int, default=0, help="Layer NO. of CLIP need to freeze.")
 
     parser.add_argument("--pretrained_clip_name", default="ViT-B/32", type=str, help="Choose a CLIP version")
+    parser.add_argument("--visual_branches", nargs="+", default=list(VISUAL_BRANCHES), choices=VISUAL_BRANCHES,
+                        help="Visual branches to build; drop any for an ablation, e.g. --visual_branches residual mv")
 
     args = parser.parse_args()
 
