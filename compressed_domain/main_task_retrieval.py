@@ -13,12 +13,12 @@ from metrics import compute_metrics
 import time
 import argparse
 from modules.tokenization_clip import SimpleTokenizer as ClipTokenizer
-from modules.modeling import CLIP4ClipCompressed, VISUAL_BRANCHES
+from modules.modeling import CLIP4ClipCompressed
 from modules.optimization import BertAdam
 
 from util import get_logger
 from dataloaders.data_dataloaders import DATALOADER_DICT
-TRAIN_SUBSET_SIZE = 8000
+TRAIN_SUBSET_SIZE = 10000
 
 global logger
 
@@ -83,8 +83,6 @@ def get_args(description='CLIP4Clip on Retrieval Task (single-GPU, MSRVTT)'):
     parser.add_argument('--freeze_layer_num', type=int, default=0, help="Layer NO. of CLIP need to freeze.")
 
     parser.add_argument("--pretrained_clip_name", default="ViT-B/32", type=str, help="Choose a CLIP version")
-    parser.add_argument("--visual_branches", nargs="+", default=list(VISUAL_BRANCHES), choices=VISUAL_BRANCHES,
-                        help="Visual branches to build; drop any for an ablation, e.g. --visual_branches residual mv")
 
     args = parser.parse_args()
 
@@ -455,20 +453,11 @@ def main():
 
         resumed_epoch = 0
         if args.resume_model:
-            # KNOWN ISSUE -- optimizer.load_state_dict() disabled here: it forces
-            # a one-shot allocation of Adam's momentum/variance buffers for every
-            # trainable param across all 3 ViT-B/32 branches, which appears to
-            # trigger the OS OOM-killer (silent SIGKILL, unguardable from Python --
-            # see chat). Model weights still resume via --init_model; epoch count
-            # still resumes from the checkpoint. Optimizer state (momentum,
-            # schedule position) restarts fresh instead. Fix later: likely smaller
-            # batch_size/frame caps just for this step, or loading optimizer state
-            # param-by-param onto GPU instead of all at once.
+            # "runs:/<run_id>/pytorch_opt.last" -- what save_model logs it as.
             checkpoint = mlflow.pytorch.load_state_dict(args.resume_model, map_location='cpu')
+            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
             resumed_epoch = checkpoint['epoch'] + 1
-            logger.warning("Optimizer state NOT resumed (disabled -- see KNOWN ISSUE comment in code). "
-                            "Resuming epoch=%d with a fresh optimizer.", resumed_epoch)
-        
+
         global_step = 0
         for epoch in range(resumed_epoch, args.epochs):
             tr_loss, global_step = train_epoch(epoch, args, model, train_dataloader, device, optimizer, global_step)
