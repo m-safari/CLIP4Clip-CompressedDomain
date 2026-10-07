@@ -8,6 +8,7 @@ import numpy as np
 import random
 import os
 import mlflow
+import mlflow.pytorch
 from metrics import compute_metrics
 import time
 import argparse
@@ -17,7 +18,7 @@ from modules.optimization import BertAdam
 
 from util import get_logger
 from dataloaders.data_dataloaders import DATALOADER_DICT
-TRAIN_SUBSET_SIZE = 2000
+TRAIN_SUBSET_SIZE = 8000
 
 global logger
 
@@ -55,8 +56,15 @@ def get_args(description='CLIP4Clip on Retrieval Task (single-GPU, MSRVTT)'):
 
     parser.add_argument("--output_dir", default=None, type=str, required=True,
                         help="The output directory where the model predictions and checkpoints will be written.")
-    parser.add_argument("--init_model", default=None, type=str, required=False, help="Initial model.")
-    parser.add_argument("--resume_model", default=None, type=str, required=False, help="Resume train model.")
+    parser.add_argument("--init_model", default=None, type=str, required=False,
+                        help="Initial model weights: either a local file path, or an mlflow artifact URI "
+                             "e.g. runs:/<run_id>/pytorch_model.last (or .best). To fully resume training "
+                             "from a checkpoint, pass this together with --resume_model from the same run.")
+    parser.add_argument("--resume_model", default=None, type=str, required=False,
+                        help="mlflow artifact URI of the OPTIMIZER checkpoint to resume from, "
+                             "e.g. runs:/<run_id>/pytorch_opt.last -- restores optimizer state + epoch "
+                             "number only. Pass --init_model with the matching pytorch_model.* URI "
+                             "alongside this to also restore the model weights.")
     parser.add_argument("--do_lower_case", action='store_true', help="Set this flag if you are using an uncased model.")
     parser.add_argument('--expand_msrvtt_sentences', action='store_true', help="")
     parser.add_argument('--train_frame_order', type=int, default=0, choices=[0, 1, 2],
@@ -119,14 +127,16 @@ def init_device():
 
 def init_model(args, device):
     if args.init_model:
-        model_state_dict = torch.load(args.init_model, map_location='cpu')
+        if args.init_model.startswith("runs:/") or args.init_model.startswith("models:/"):
+            model_state_dict = mlflow.pytorch.load_state_dict(args.init_model, map_location='cpu')
+        else:
+            model_state_dict = torch.load(args.init_model, map_location='cpu')
     else:
         model_state_dict = None
-
+ 
     model = CLIP4ClipCompressed.from_pretrained(state_dict=model_state_dict, task_config=args)
     model.to(device)
     return model
-
 
 def prep_optimizer(args, model, num_train_optimization_steps, coef_lr=1.):
     param_optimizer = list(model.named_parameters())
@@ -157,33 +167,47 @@ def prep_optimizer(args, model, num_train_optimization_steps, coef_lr=1.):
     return optimizer, model
 
 
-def save_model(epoch, args, model, optimizer, tr_loss, type_name=""):
-    output_model_file = os.path.join(
-        args.output_dir, "pytorch_model.bin.{}{}".format("" if type_name == "" else type_name + ".", epoch))
-    optimizer_state_file = os.path.join(
-        args.output_dir, "pytorch_opt.bin.{}{}".format("" if type_name == "" else type_name + ".", epoch))
-    torch.save(model.state_dict(), output_model_file)
-    torch.save({
+def save_model(epoch, args, model, optimizer, tr_loss, type_name="last"):
+    # type_name ("last" or "best") IS the artifact path -- no epoch in the
+    # path, so saving again just overwrites the previous file for that type
+    # instead of accumulating a new one per epoch. Storage stays bounded to
+    # one model + one optimizer checkpoint per type, ever, in this run.
+    model_artifact_path = "pytorch_model.{}".format(type_name)
+    optimizer_artifact_path = "pytorch_opt.{}".format(type_name)
+ 
+    mlflow.pytorch.log_state_dict(model.state_dict(), artifact_path=model_artifact_path)
+    mlflow.pytorch.log_state_dict({
             'epoch': epoch,
             'optimizer_state_dict': optimizer.state_dict(),
             'loss': tr_loss,
-            }, optimizer_state_file)
-    logger.info("Model saved to %s", output_model_file)
-    logger.info("Optimizer saved to %s", optimizer_state_file)
+            }, artifact_path=optimizer_artifact_path)
+ 
+    run_id = mlflow.active_run().info.run_id
+    output_model_file = "runs:/{}/{}".format(run_id, model_artifact_path)
+    logger.info("Model (%s) saved to %s", type_name, output_model_file)
+    logger.info("Optimizer (%s) saved to runs:/%s/%s", type_name, run_id, optimizer_artifact_path)
     return output_model_file
-
-
-def load_model(epoch, args, device, model_file=None):
-    if model_file is None or len(model_file) == 0:
-        model_file = os.path.join(args.output_dir, "pytorch_model.bin.{}".format(epoch))
-    if os.path.exists(model_file):
-        model_state_dict = torch.load(model_file, map_location='cpu')
-        logger.info("Model loaded from %s", model_file)
-        model = CLIP4ClipCompressed.from_pretrained(state_dict=model_state_dict, task_config=args)
-        model.to(device)
-    else:
-        model = None
+ 
+ 
+def load_model(args, device, type_name="last", model_uri=None):
+    # model_uri: an mlflow artifact URI, e.g. "runs:/<run_id>/pytorch_model.best"
+    # (exactly what save_model returns). Falls back to the current active
+    # run's "last"/"best" artifact if no URI is given.
+    if not model_uri:
+        run_id = mlflow.active_run().info.run_id
+        model_uri = "runs:/{}/pytorch_model.{}".format(run_id, type_name)
+ 
+    try:
+        model_state_dict = mlflow.pytorch.load_state_dict(model_uri, map_location='cpu')
+    except Exception:
+        logger.info("No mlflow checkpoint found at %s", model_uri)
+        return None
+ 
+    logger.info("Model loaded from %s", model_uri)
+    model = CLIP4ClipCompressed.from_pretrained(state_dict=model_state_dict, task_config=args)
+    model.to(device)
     return model
+
 
 
 def train_epoch(epoch, args, model, train_dataloader, device, optimizer, global_step):
@@ -306,9 +330,42 @@ def main():
     args = set_seed_logger(args)
     
     mlflow.set_tracking_uri("sqlite:///" + os.path.join(args.output_dir, "mlflow.db"))
+    # artifact_location can only be set when an experiment is first created --
+    # it can't be changed afterward. If this experiment already exists (same
+    # output_dir reused), its artifact root is whatever it was before; this
+    # only puts artifacts under output_dir for a fresh experiment/output_dir.
+    artifact_root = "file:" + os.path.join(args.output_dir, "mlartifacts")
+    experiment = mlflow.get_experiment_by_name(MLFLOW_EXPERIMENT_NAME)
+    if experiment is None:
+        mlflow.create_experiment(MLFLOW_EXPERIMENT_NAME, artifact_location=artifact_root)
+    else:
+        logger.info("Experiment '%s' already exists, artifact_location=%s (fixed at creation, not changed here)",
+                    MLFLOW_EXPERIMENT_NAME, experiment.artifact_location)
+    
+    
     mlflow.set_experiment(MLFLOW_EXPERIMENT_NAME)
-    mlflow.start_run(run_name=os.path.basename(os.path.normpath(args.output_dir)))
-    mlflow.log_params(vars(args))
+
+    # If resuming (--resume_model is "runs:/<run_id>/..."), reopen that SAME
+    # run instead of starting a new one -- otherwise save_model's "last"/"best"
+    # overwrite logic overwrites inside a brand-new run every time, not the
+    # run you meant to continue, which is exactly what created the extra
+    # artifact directory you saw.
+    resume_run_id = None
+    if args.resume_model and args.resume_model.startswith("runs:/"):
+        resume_run_id = args.resume_model.split("runs:/", 1)[1].split("/", 1)[0]
+
+    if resume_run_id:
+        mlflow.start_run(run_id=resume_run_id)
+        logger.info("Resuming mlflow run %s -- checkpoints will overwrite its existing artifacts", resume_run_id)
+    else:
+        mlflow.start_run(run_name=os.path.basename(os.path.normpath(args.output_dir)))
+
+    try:
+        mlflow.log_params(vars(args))
+    except mlflow.exceptions.MlflowException:
+        # Re-logging into a resumed run raises if any param value differs from
+        # the original run (e.g. --epochs changed) -- not fatal, just skip.
+        logger.info("Some params differ from the original run; skipped re-logging params.")
  
 
     device = init_device()
@@ -396,21 +453,31 @@ def main():
 
         resumed_epoch = 0
         if args.resume_model:
-            checkpoint = torch.load(args.resume_model, map_location='cpu')
-            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            # KNOWN ISSUE -- optimizer.load_state_dict() disabled here: it forces
+            # a one-shot allocation of Adam's momentum/variance buffers for every
+            # trainable param across all 3 ViT-B/32 branches, which appears to
+            # trigger the OS OOM-killer (silent SIGKILL, unguardable from Python --
+            # see chat). Model weights still resume via --init_model; epoch count
+            # still resumes from the checkpoint. Optimizer state (momentum,
+            # schedule position) restarts fresh instead. Fix later: likely smaller
+            # batch_size/frame caps just for this step, or loading optimizer state
+            # param-by-param onto GPU instead of all at once.
+            checkpoint = mlflow.pytorch.load_state_dict(args.resume_model, map_location='cpu')
             resumed_epoch = checkpoint['epoch'] + 1
-
+            logger.warning("Optimizer state NOT resumed (disabled -- see KNOWN ISSUE comment in code). "
+                            "Resuming epoch=%d with a fresh optimizer.", resumed_epoch)
+        
         global_step = 0
         for epoch in range(resumed_epoch, args.epochs):
             tr_loss, global_step = train_epoch(epoch, args, model, train_dataloader, device, optimizer, global_step)
             logger.info("Epoch %d/%s Finished, Train Loss: %f", epoch + 1, args.epochs, tr_loss)
 
-            output_model_file = save_model(epoch, args, model, optimizer, tr_loss, type_name="")
-
+            save_model(epoch, args, model, optimizer, tr_loss, type_name="last")
+ 
             R1 = eval_epoch(args, model, test_dataloader, device, epoch=epoch)
             if best_score <= R1:
                 best_score = R1
-                best_output_model_file = output_model_file
+                best_output_model_file = save_model(epoch, args, model, optimizer, tr_loss, type_name="best")
             logger.info("The best model is: {}, the R1 is: {:.4f}".format(best_output_model_file, best_score))
 
     elif args.do_eval:
