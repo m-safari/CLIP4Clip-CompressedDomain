@@ -51,6 +51,9 @@ def resolve_visual_branches(task_config):
 #               behaviour); a modality's weight is its share of the frames.
 VISUAL_POOLINGS = ("modality", "frame")
 
+# Initialisation of the motion-vector encoder (see from_pretrained).
+MV_INITS = ("random", "clip")
+
 
 def resolve_visual_pooling(task_config):
     pooling = getattr(task_config, "visual_pooling", None) or "modality"
@@ -111,9 +114,24 @@ class CLIP4ClipPreTrainedModel(PreTrainedModel, nn.Module):
                     if new_key not in state_dict:
                         state_dict[new_key] = val.clone()
 
-        # Motion-vector branch is intentionally left with its random initialization:
-        # its 2-channel (dx, dy) input has no correspondence to RGB, so warm-starting
-        # it from CLIP's RGB conv1 filters would be a speculative, ungrounded choice.
+        # Motion-vector branch. By default it keeps its random initialization: its
+        # 2-channel (dx, dy) input has no correspondence to RGB. With
+        # task_config.mv_init == "clip" it is warm-started like the residual branch:
+        # CLIP's visual transformer is copied, and the 2-channel patch embedding is
+        # the mean of CLIP's RGB filters (CoViAR likewise starts its motion-vector
+        # network from image-pretrained weights). A checkpoint's own mv_encoder
+        # weights always take precedence.
+        mv_init = getattr(task_config, "mv_init", None) or "random"
+        if mv_init not in MV_INITS:
+            raise ValueError("Unknown mv_init {!r}; valid values are {}".format(mv_init, MV_INITS))
+        if mv_init == "clip" and "mv" in resolve_visual_branches(task_config):
+            for key, val in clip_state_dict.items():
+                if key.startswith("visual."):
+                    new_key = "mv_encoder." + key[len("visual."):]
+                    if new_key not in state_dict:
+                        if key == "visual.conv1.weight":
+                            val = val.mean(dim=1, keepdim=True).repeat(1, 2, 1, 1)
+                        state_dict[new_key] = val.clone()
 
         config = _EmptyConfig()
         model = cls(config, clip_state_dict, task_config)
@@ -221,6 +239,10 @@ class CLIP4ClipCompressed(CLIP4ClipPreTrainedModel):
 
         self.visual_pooling = resolve_visual_pooling(task_config)
         show_log(task_config, "visual_pooling: {}".format(self.visual_pooling))
+
+        # Weight of the per-branch auxiliary losses (see forward). 0 = off.
+        self.modality_loss_weight = float(getattr(task_config, "modality_loss_weight", 0.) or 0.)
+        show_log(task_config, "modality_loss_weight: {}".format(self.modality_loss_weight))
 
         if getattr(task_config, "grad_checkpoint", False):
             for encoder in (self.clip.visual, self.residual_encoder, self.mv_encoder):
@@ -377,6 +399,35 @@ class CLIP4ClipCompressed(CLIP4ClipPreTrainedModel):
     def get_similarity_logits(self, sequence_output, visual_output, attention_mask, video_mask):
         return self._loose_similarity(sequence_output, visual_output, attention_mask, video_mask)
 
+    def _modality_loss(self, sequence_output, visual_output, video_mask):
+        """
+        Mean, over the built branches, of the same symmetric contrastive loss
+        computed between the text and THAT branch's embedding alone.
+
+        The main loss only sees the average of the branch embeddings, so a branch
+        that already solves the task (the CLIP-pretrained I-frame tower) leaves
+        the others with little to learn. This term makes every branch align with
+        the text on its own. Needs per-branch embeddings, i.e. modality pooling
+        with more than one branch; otherwise it is 0.
+        """
+        zero = visual_output.new_zeros(())
+        if self.visual_pooling != "modality" or visual_output.shape[1] < 2:
+            return zero
+
+        text = sequence_output.contiguous().squeeze(1)
+        text = text / text.norm(dim=-1, keepdim=True)
+        logit_scale = self.clip.logit_scale.exp()
+
+        losses = []
+        for m in range(visual_output.shape[1]):
+            rows = video_mask[:, m] > 0              # videos that have this branch
+            if int(rows.sum()) < 2:
+                continue
+            branch = _safe_normalize(visual_output[rows, m])
+            sim = logit_scale * torch.matmul(text[rows], branch.t())
+            losses.append((self.loss_fct(sim) + self.loss_fct(sim.T)) / 2)
+        return torch.stack(losses).mean() if losses else zero
+
     # ---------------------------------------------------------------- #
     # Forward
     # ---------------------------------------------------------------- #
@@ -395,6 +446,9 @@ class CLIP4ClipCompressed(CLIP4ClipPreTrainedModel):
             sim_loss1 = self.loss_fct(sim_matrix)
             sim_loss2 = self.loss_fct(sim_matrix.T)
             loss = (sim_loss1 + sim_loss2) / 2
+            if self.modality_loss_weight > 0:
+                loss = loss + self.modality_loss_weight * self._modality_loss(
+                    sequence_output, visual_output, video_mask)
             return loss
 
         return None

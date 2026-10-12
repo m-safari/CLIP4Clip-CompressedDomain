@@ -74,3 +74,41 @@ def tensor_video_to_text_sim(sim_tensor):
     # Forms a similarity matrix for use with rank at k
     values, _ = torch.max(sim_tensor, dim=1, keepdim=True)
     return torch.squeeze(values).T
+
+
+# ---------------------------------------------------------------------- #
+# Branch-subset retrieval from saved per-branch embeddings (NumPy only)
+# ---------------------------------------------------------------------- #
+
+def _unit(x, eps=1e-6):
+    x = np.asarray(x, dtype=np.float64)
+    return x / np.clip(np.linalg.norm(x, axis=-1, keepdims=True), eps, None)
+
+
+def pool_branches(branch_embeddings, branch_mask, keep=None):
+    """
+    Video embeddings from any subset of the visual branches.
+
+    branch_embeddings: (N, M, D) one embedding per video and built branch, as
+                       returned by CLIP4ClipCompressed.get_visual_output with
+                       visual_pooling == "modality".
+    branch_mask:       (N, M) 1 where the video has that branch.
+    keep:              indices of the branches to use (None = all).
+
+    Mirrors CLIP4ClipCompressed.pool_video: L2-normalise each branch embedding,
+    average the kept ones that exist, L2-normalise. A video with none of the
+    kept branches gets a zero vector (similarity 0 to every caption).
+    Returns (N, D).
+    """
+    emb = _unit(branch_embeddings)
+    mask = np.asarray(branch_mask, dtype=np.float64)
+    if keep is not None:
+        keep = list(keep)
+        emb, mask = emb[:, keep], mask[:, keep]
+    pooled = (emb * mask[..., None]).sum(axis=1) / np.clip(mask.sum(axis=1, keepdims=True), 1.0, None)
+    return _unit(pooled)
+
+
+def branch_subset_similarity(text_embeddings, branch_embeddings, branch_mask, keep=None):
+    """(N_text, N_video) cosine similarity using only the branches in `keep`."""
+    return _unit(text_embeddings) @ pool_branches(branch_embeddings, branch_mask, keep).T

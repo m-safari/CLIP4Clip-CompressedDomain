@@ -7,13 +7,14 @@ import torch
 import numpy as np
 import random
 import os
+import json
 import mlflow
 import mlflow.pytorch
-from metrics import compute_metrics
+from metrics import compute_metrics, branch_subset_similarity
 import time
 import argparse
 from modules.tokenization_clip import SimpleTokenizer as ClipTokenizer
-from modules.modeling import CLIP4ClipCompressed, VISUAL_BRANCHES, VISUAL_POOLINGS
+from modules.modeling import CLIP4ClipCompressed, VISUAL_BRANCHES, VISUAL_POOLINGS, MV_INITS
 from modules.optimization import BertAdam
 
 from util import get_logger
@@ -112,6 +113,31 @@ def get_args(description='CLIP4Clip on Retrieval Task (single-GPU, MSRVTT)'):
     parser.add_argument("--visual_pooling", default="modality", choices=VISUAL_POOLINGS,
                         help="modality: every modality weighs the same in the video embedding. "
                              "frame: one mean over all frames of all modalities (original behaviour).")
+    parser.add_argument("--modality_loss_weight", type=float, default=0.,
+                        help="Weight of an extra contrastive loss between the text and EACH branch's own "
+                             "embedding (mean over branches). 0 = off. Makes every branch align with the "
+                             "text by itself instead of leaning on the strongest one.")
+    parser.add_argument("--mv_init", default="random", choices=MV_INITS,
+                        help="random: motion-vector encoder trained from scratch. clip: start it from CLIP's "
+                             "visual tower (2-channel patch embedding = mean of the RGB filters).")
+    parser.add_argument("--residual_coef_lr", type=float, default=None,
+                        help="LR multiplier of the residual encoder. Default: --coef_lr.")
+    parser.add_argument("--mv_coef_lr", type=float, default=1.,
+                        help="LR multiplier of the motion-vector encoder. Default 1 (trains at --lr).")
+    parser.add_argument("--eval_on", default=None, choices=["val", "test"],
+                        help="With --do_eval: which CSV to evaluate. Default: test if --test_csv is given, "
+                             "else val.")
+    parser.add_argument("--mlflow_tracking_uri", default=None, type=str,
+                        help="Where mlflow keeps metrics and params. Default: sqlite:///<output_dir>/mlflow.db. "
+                             "Point several runs at the same URI to see them side by side.")
+    parser.add_argument("--mlflow_artifact_root", default=None, type=str,
+                        help="Directory (or URI) for mlflow artifacts: the last/best checkpoints and embeddings. "
+                             "Default: <output_dir>/mlartifacts. Only applies when the experiment is first "
+                             "created; an existing experiment keeps its artifact location.")
+    parser.add_argument("--mlflow_experiment", default=MLFLOW_EXPERIMENT_NAME, type=str,
+                        help="mlflow experiment name.")
+    parser.add_argument("--run_name", default=None, type=str,
+                        help="mlflow run name. Default: the last component of --output_dir.")
     parser.add_argument("--precision", default="amp", choices=["amp", "fp16"],
                         help="amp: fp32 weights and optimizer state, autocast + GradScaler (recommended). "
                              "fp16: the original hard half-precision weights, kept for comparison.")
@@ -208,32 +234,47 @@ def freeze_parameters(args, model):
                     count(prefix, True) / 1e6, count(prefix, False) / 1e6)
 
 
+TOWER_PREFIXES = (("text", tuple("clip." + p for p in TEXT_BRANCH_PREFIXES)), ("iframe", ("clip.visual.",)),
+                  ("residual", ("residual_encoder.",)), ("mv", ("mv_encoder.",)))
+
+
 def prep_optimizer(args, model, num_train_optimization_steps, coef_lr=1.):
     # Frozen parameters are left out entirely: no weight decay, no optimizer state.
     param_optimizer = [(n, p) for n, p in model.named_parameters() if p.requires_grad]
     no_decay = ['bias', 'LayerNorm.bias', 'LayerNorm.weight']
 
-    # CLIP-initialised weights get the small learning rate (lr * coef_lr). That is
-    # model.clip AND the residual encoder, which starts as a copy of CLIP's visual
-    # tower. Only weights trained from scratch (the motion-vector encoder) get lr.
-    def is_pretrained(n):
-        return n.startswith("clip.") or n.startswith("residual_encoder.")
+    # Learning-rate classes, as multipliers of --lr:
+    #   "clip":     model.clip (text + I-frame towers)            -> coef_lr
+    #   "residual": the residual encoder, a copy of CLIP's visual -> residual_coef_lr (default coef_lr)
+    #   "mv":       the motion-vector encoder                     -> mv_coef_lr (default 1)
+    # The residual encoder shares the "clip" groups unless it has its own
+    # multiplier, so the default group layout never changes (optimizer
+    # checkpoints stay loadable).
+    residual_coef_lr = getattr(args, "residual_coef_lr", None)
+    mv_coef_lr = getattr(args, "mv_coef_lr", 1.)
+    split_residual = residual_coef_lr is not None and residual_coef_lr != coef_lr
+    multipliers = {"clip": coef_lr, "residual": residual_coef_lr, "mv": 1. if mv_coef_lr is None else mv_coef_lr}
+
+    def lr_class(n):
+        if n.startswith("residual_encoder."):
+            return "residual" if split_residual else "clip"
+        return "clip" if n.startswith("clip.") else "mv"
 
     def is_no_decay(n):
         return any(nd in n for nd in no_decay)
 
     weight_decay = 0.2
-    groups = [
-        {'params': [p for n, p in param_optimizer if is_pretrained(n) and not is_no_decay(n)],
-         'weight_decay': weight_decay, 'lr': args.lr * coef_lr},
-        {'params': [p for n, p in param_optimizer if not is_pretrained(n) and not is_no_decay(n)],
-         'weight_decay': weight_decay},
-        {'params': [p for n, p in param_optimizer if is_pretrained(n) and is_no_decay(n)],
-         'weight_decay': 0.0, 'lr': args.lr * coef_lr},
-        {'params': [p for n, p in param_optimizer if not is_pretrained(n) and is_no_decay(n)],
-         'weight_decay': 0.0},
-    ]
-    optimizer_grouped_parameters = [g for g in groups if len(g['params']) > 0]
+    classes = ["clip", "mv"] + (["residual"] if split_residual else [])
+    optimizer_grouped_parameters = []
+    for decay in (True, False):
+        for name in classes:
+            params = [p for n, p in param_optimizer if lr_class(n) == name and is_no_decay(n) != decay]
+            if not params:
+                continue
+            group = {'params': params, 'weight_decay': weight_decay if decay else 0.0}
+            if name != "mv" or multipliers["mv"] != 1.:
+                group['lr'] = args.lr * multipliers[name]
+            optimizer_grouped_parameters.append(group)
 
     optimizer = BertAdam(optimizer_grouped_parameters, lr=args.lr, warmup=args.warmup_proportion,
                          schedule='warmup_cosine', b1=0.9, b2=0.98, e=1e-6,
@@ -241,6 +282,20 @@ def prep_optimizer(args, model, num_train_optimization_steps, coef_lr=1.):
                          max_grad_norm=1.0)
 
     return optimizer, model
+
+
+def tower_grad_norms(model):
+    """Gradient L2 norm of each trainable tower (call before the gradients are clipped)."""
+    norms = {}
+    for tower, prefixes in TOWER_PREFIXES:
+        total, found = 0., False
+        for n, p in model.named_parameters():
+            if p.grad is not None and n.startswith(prefixes):
+                total += float(p.grad.detach().float().pow(2).sum())
+                found = True
+        if found:
+            norms[tower] = total ** 0.5
+    return norms
 
 
 def save_model(args, model, optimizer=None, train_state=None, type_name="last"):
@@ -351,6 +406,7 @@ def train_epoch(epoch, args, model, train_dataloader, device, optimizer, scaler,
 
         if (step + 1) % args.gradient_accumulation_steps == 0:
             scaler.unscale_(optimizer)
+            tower_norms = tower_grad_norms(model) if (global_step + 1) % log_step == 0 else {}
             grad_norm = float(torch.nn.utils.clip_grad_norm_(trainable_params, 1.0))
             # Read before zero_grad(): BertAdam.get_lr() only reports parameters that have a gradient.
             lrs = sorted(set(optimizer.get_lr()))
@@ -366,13 +422,17 @@ def train_epoch(epoch, args, model, train_dataloader, device, optimizer, scaler,
                 v_zero = optimizer_diagnostics(optimizer)
                 peak_gb = torch.cuda.max_memory_allocated() / 2 ** 30 if device.type == "cuda" else 0.
                 avg_loss = window_loss / max(window_batches, 1)
-                logger.info("Epoch: %d/%s, Step: %d/%d, Lr: %s, Loss: %f, GradNorm: %.3f, AdamV==0: %.1f%%, "
+                logger.info("Epoch: %d/%s, Step: %d/%d, Lr: %s, Loss: %f, GradNorm: %.3f (%s), AdamV==0: %.1f%%, "
                             "AmpScale: %g, PeakMem: %.2fGB, Time/step: %f", epoch + 1,
                             args.epochs, step + 1,
                             len(train_dataloader), "-".join([str('%.9f' % itm) for itm in lrs]),
-                            avg_loss, grad_norm, 100 * v_zero, scaler.get_scale() if use_amp else 1.,
+                            avg_loss, grad_norm,
+                            ", ".join("{} {:.2f}".format(k, v) for k, v in tower_norms.items()),
+                            100 * v_zero, scaler.get_scale() if use_amp else 1.,
                             peak_gb,
                             (time.time() - start_time) / (log_step * args.gradient_accumulation_steps))
+                mlflow.log_metrics({"grad_norm_" + k: (v if np.isfinite(v) else -1.)
+                                    for k, v in tower_norms.items()}, step=global_step)
                 mlflow.log_metrics({
                     "train_loss": avg_loss,
                     "lr_min": lrs[0] if lrs else 0.,
@@ -414,11 +474,14 @@ def eval_epoch(args, model, test_dataloader, device, step=0, prefix="val"):
     per video). Metrics go to mlflow as <prefix>_* at `step`.
     Videos that failed to decode are excluded, together with their captions,
     and their count is reported.
+
+    Returns (text-to-video R@1, embeddings): `embeddings` holds everything the
+    analysis notebook needs (see save_embeddings).
     """
     model = model.to(device)
     model.eval()
     use_amp = args.precision == "amp" and device.type == "cuda"
-    failed_videos = 0
+    valid_flags = []
 
     with torch.no_grad():
         batch_list_t, batch_list_v = [], []
@@ -428,8 +491,8 @@ def eval_epoch(args, model, test_dataloader, device, step=0, prefix="val"):
             batch = tuple(t.to(device) for t in batch)
 
             valid = model.valid_video_rows(batch[4], batch[6], batch[8])
+            valid_flags.append(valid.cpu().numpy())
             if not bool(valid.all()):
-                failed_videos += int((~valid).sum())
                 if not bool(valid.any()):
                     continue
                 batch = tuple(t[valid] for t in batch)
@@ -456,6 +519,41 @@ def eval_epoch(args, model, test_dataloader, device, step=0, prefix="val"):
                                           batch_sequence_output_list, batch_visual_output_list)
         sim_matrix = np.concatenate(tuple(sim_matrix), axis=0)
 
+        # Per-branch embeddings, for the branch ablation and the analysis notebook.
+        text_embeddings = torch.cat(batch_sequence_output_list, dim=0).squeeze(1)
+        text_embeddings = text_embeddings / text_embeddings.norm(dim=-1, keepdim=True)
+        if model.visual_pooling == "modality":
+            branches = list(model.visual_branches)
+            branch_embeddings = torch.cat(batch_visual_output_list, dim=0)
+            branch_mask = torch.cat([v[0] for v in batch_list_v], dim=0)
+        else:
+            # Frame pooling has no per-branch embedding: store the pooled video as one pseudo-branch.
+            branches = ["+".join(model.visual_branches)]
+            branch_embeddings = torch.cat([model.pool_video(v, m[0]) for v, m in
+                                           zip(batch_visual_output_list, batch_list_v)], dim=0).unsqueeze(1)
+            branch_mask = torch.ones(branch_embeddings.shape[:2], dtype=torch.long)
+
+    valid_flags = np.concatenate(valid_flags).astype(bool)
+    failed_videos = int((~valid_flags).sum())
+    dataset = test_dataloader.dataset
+    video_ids = np.asarray(dataset.csv["video_id"].values).astype(str)
+    if getattr(dataset, "csv_has_sentence", False):
+        captions = np.asarray(dataset.csv["sentence"].values).astype(str)
+    else:
+        captions = np.asarray([""] * len(video_ids))
+    embeddings = {
+        "text_embeddings": text_embeddings.cpu().numpy().astype(np.float32),
+        "branch_embeddings": branch_embeddings.cpu().numpy().astype(np.float32),
+        "branch_mask": branch_mask.cpu().numpy().astype(np.int8),
+        "branches": np.asarray(branches),
+        "video_ids": video_ids[valid_flags],
+        "captions": captions[valid_flags],
+        "failed_video_ids": video_ids[~valid_flags],
+        "logit_scale": np.float32(model.clip.logit_scale.exp().item()),
+        "visual_pooling": np.asarray(model.visual_pooling),
+        "step": np.int64(step),
+    }
+
     logger.info("[%s] sim matrix size: %d, %d", prefix, sim_matrix.shape[0], sim_matrix.shape[1])
     if failed_videos:
         logger.warning("[%s] %d videos failed to decode and were excluded from the metrics.", prefix, failed_videos)
@@ -472,7 +570,7 @@ def eval_epoch(args, model, test_dataloader, device, step=0, prefix="val"):
     logger.info('\t>>>  V2T$R@1: {:.1f} - V2T$R@5: {:.1f} - V2T$R@10: {:.1f} - V2T$Median R: {:.1f} - V2T$Mean R: {:.1f}'.
                 format(vt_metrics['R1'], vt_metrics['R5'], vt_metrics['R10'], vt_metrics['MR'], vt_metrics['MeanR']))
 
-    mlflow.log_metrics({
+    to_log = {
         prefix + "_t2v_R1": tv_metrics['R1'],
         prefix + "_t2v_R5": tv_metrics['R5'],
         prefix + "_t2v_R10": tv_metrics['R10'],
@@ -485,9 +583,43 @@ def eval_epoch(args, model, test_dataloader, device, step=0, prefix="val"):
         prefix + "_v2t_MeanR": float(vt_metrics['MeanR']),
         prefix + "_num_candidates": float(sim_matrix.shape[0]),
         prefix + "_num_failed_videos": float(failed_videos),
-    }, step=step)
+    }
 
-    return tv_metrics['R1']
+    # What each branch retrieves BY ITSELF inside this jointly trained model.
+    if len(branches) > 1:
+        logger.info("[%s] Text-to-Video using one branch alone:", prefix)
+        for i, branch in enumerate(branches):
+            m = compute_metrics(branch_subset_similarity(
+                embeddings["text_embeddings"], embeddings["branch_embeddings"], embeddings["branch_mask"], [i]))
+            logger.info('\t>>>  %-8s R@1: %.1f - R@5: %.1f - R@10: %.1f - Median R: %.1f',
+                        branch, m['R1'], m['R5'], m['R10'], m['MR'])
+            to_log.update({"{}_t2v_R1_{}".format(prefix, branch): m['R1'],
+                           "{}_t2v_R10_{}".format(prefix, branch): m['R10'],
+                           "{}_t2v_MedianR_{}".format(prefix, branch): float(m['MR'])})
+
+    mlflow.log_metrics(to_log, step=step)
+
+    return tv_metrics['R1'], embeddings
+
+
+def save_embeddings(args, embeddings, split):
+    """
+    Write <output_dir>/embeddings_<split>.npz and log it to mlflow (a few MB).
+
+    Contents, rows in CSV order with failed videos removed:
+        text_embeddings   (N, D)     L2-normalised caption embeddings
+        branch_embeddings (N, M, D)  one video embedding per built visual branch
+        branch_mask       (N, M)     1 where the video has that branch
+        branches          (M,)       branch names, in the order of the M axis
+        video_ids, captions (N,)     row i's caption is the query for row i's video
+        failed_video_ids, logit_scale, visual_pooling, step
+    The video embedding of any subset of branches is metrics.pool_branches().
+    """
+    path = os.path.join(args.output_dir, "embeddings_{}.npz".format(split))
+    np.savez_compressed(path, **embeddings)
+    mlflow.log_artifact(path, artifact_path="embeddings")
+    logger.info("Embeddings (%s) saved to %s", split, path)
+    return path
 
 
 def resolve_resume(args):
@@ -530,20 +662,30 @@ def main():
     args = set_seed_logger(args)
     params_to_log = dict(vars(args))
 
-    mlflow.set_tracking_uri("sqlite:///" + os.path.join(args.output_dir, "mlflow.db"))
+    # Tracking store, artifact root and experiment are all selectable; the
+    # defaults keep everything of a run inside its --output_dir.
+    tracking_uri = args.mlflow_tracking_uri or "sqlite:///" + os.path.join(args.output_dir, "mlflow.db")
+    mlflow.set_tracking_uri(tracking_uri)
     # artifact_location can only be set when an experiment is first created --
-    # it can't be changed afterward. If this experiment already exists (same
-    # output_dir reused), its artifact root is whatever it was before; this
-    # only puts artifacts under output_dir for a fresh experiment/output_dir.
-    artifact_root = "file:" + os.path.join(args.output_dir, "mlartifacts")
-    experiment = mlflow.get_experiment_by_name(MLFLOW_EXPERIMENT_NAME)
+    # it can't be changed afterward. An existing experiment keeps the artifact
+    # root it was created with.
+    artifact_root = args.mlflow_artifact_root or os.path.join(args.output_dir, "mlartifacts")
+    if "://" not in artifact_root and not artifact_root.startswith("file:"):
+        artifact_root = "file:" + os.path.abspath(artifact_root)
+    experiment = mlflow.get_experiment_by_name(args.mlflow_experiment)
     if experiment is None:
-        mlflow.create_experiment(MLFLOW_EXPERIMENT_NAME, artifact_location=artifact_root)
+        mlflow.create_experiment(args.mlflow_experiment, artifact_location=artifact_root)
+        logger.info("mlflow: tracking=%s, experiment '%s' created, artifacts=%s",
+                    tracking_uri, args.mlflow_experiment, artifact_root)
     else:
-        logger.info("Experiment '%s' already exists, artifact_location=%s (fixed at creation, not changed here)",
-                    MLFLOW_EXPERIMENT_NAME, experiment.artifact_location)
+        logger.info("mlflow: tracking=%s, experiment '%s' already exists, artifacts=%s (fixed at creation)",
+                    tracking_uri, args.mlflow_experiment, experiment.artifact_location)
+        if args.mlflow_artifact_root and experiment.artifact_location.rstrip("/") != artifact_root.rstrip("/"):
+            logger.warning("--mlflow_artifact_root is ignored: experiment '%s' already stores its artifacts in %s. "
+                           "Use a new --mlflow_experiment name to change it.",
+                           args.mlflow_experiment, experiment.artifact_location)
 
-    mlflow.set_experiment(MLFLOW_EXPERIMENT_NAME)
+    mlflow.set_experiment(args.mlflow_experiment)
 
     # A resumed session reopens the SAME mlflow run, so "last"/"best" keep
     # being overwritten in one place and every epoch's metrics form one
@@ -554,12 +696,19 @@ def main():
         mlflow.start_run(run_id=resume_run_id)
         logger.info("Continuing mlflow run %s", resume_run_id)
     else:
-        mlflow.start_run(run_name=os.path.basename(os.path.normpath(args.output_dir)))
+        mlflow.start_run(run_name=args.run_name or os.path.basename(os.path.normpath(args.output_dir)))
     run_id = mlflow.active_run().info.run_id
 
     if args.do_train:
         with open(os.path.join(args.output_dir, RUN_ID_FILE), "w") as f:
             f.write(run_id)
+    # For the analysis notebook: where this output_dir's run lives. An
+    # evaluation-only process never replaces a training run's record.
+    run_info_file = os.path.join(args.output_dir, "mlflow_run.json")
+    if args.do_train or not os.path.exists(run_info_file):
+        with open(run_info_file, "w") as f:
+            json.dump({"tracking_uri": tracking_uri, "experiment": args.mlflow_experiment, "run_id": run_id,
+                       "run_name": mlflow.active_run().info.run_name}, f, indent=2)
 
     try:
         mlflow.log_params(params_to_log)
@@ -667,10 +816,11 @@ def main():
             }
             save_model(args, model, optimizer, train_state, type_name="last")
 
-            R1 = eval_epoch(args, model, val_dataloader, device, step=global_step, prefix="val")
+            R1, embeddings = eval_epoch(args, model, val_dataloader, device, step=global_step, prefix="val")
             if R1 > best_score:
                 best_score, best_epoch = R1, epoch
                 best_output_model_file = save_model(args, model, type_name="best")
+                save_embeddings(args, embeddings, "val")
             mlflow.log_dict({"best_score": best_score, "best_epoch": best_epoch, "last_evaluated_epoch": epoch},
                             "train_state.json")
             logger.info("The best model is: {} (epoch {}), the val R1 is: {:.4f}".format(
@@ -678,18 +828,20 @@ def main():
             session_epochs += 1
 
     elif args.do_eval:
-        if args.test_csv:
-            eval_dataloader, eval_length = DATALOADER_DICT[DATATYPE]["test"](args, tokenizer)
-            prefix = "test"
-        else:
-            eval_dataloader, eval_length = DATALOADER_DICT[DATATYPE]["val"](args, tokenizer)
-            prefix = "val_only"
-        logger.info("***** Running %s *****", prefix)
+        eval_on = args.eval_on or ("test" if args.test_csv else "val")
+        if eval_on == "test" and not args.test_csv:
+            raise ValueError("--eval_on test needs --test_csv.")
+        eval_dataloader, eval_length = DATALOADER_DICT[DATATYPE][eval_on](args, tokenizer)
+        logger.info("***** Running %s *****", eval_on)
         logger.info("  Num examples = %d", eval_length)
         logger.info("  Batch size = %d", args.batch_size_val)
         if not args.init_model:
-            logger.warning("No --init_model: evaluating the UNTRAINED model (CLIP init, random motion-vector tower).")
-        eval_epoch(args, model, eval_dataloader, device, step=0, prefix=prefix)
+            logger.warning("No --init_model: evaluating the UNTRAINED model (CLIP init; the motion-vector tower "
+                           "is not trained).")
+        # "evalval", not "val": the val_* metric history belongs to the training curve.
+        _, embeddings = eval_epoch(args, model, eval_dataloader, device, step=0,
+                                   prefix="test" if eval_on == "test" else "evalval")
+        save_embeddings(args, embeddings, eval_on)
 
     mlflow.end_run()
 
