@@ -165,9 +165,7 @@ def encode_video(model, batch):
     visual_output, video_mask = model.get_visual_output(
         batch["iframe"], batch["iframe_mask"], batch["residuals"], batch["residuals_mask"],
         batch["mv"], batch["mv_mask"])
-    visual_output = _normalize(visual_output)
-    pooled = model._mean_pooling_for_similarity_visual(visual_output, video_mask)
-    pooled = _normalize(pooled)
+    pooled = model.pool_video(visual_output, video_mask)
     pooled[video_mask.sum(dim=1) == 0] = float("nan")
     return pooled
 

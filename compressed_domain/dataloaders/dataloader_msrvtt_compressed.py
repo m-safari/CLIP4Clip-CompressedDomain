@@ -65,6 +65,18 @@ class MSRVTT_Compressed_DataLoader(Dataset):
         max_mv_length=100,
 
         # ---------------------------------------------------------------
+        # Shared temporal budget.
+        #
+        # When max_gops is set, at most max_gops GOPs are decoded per
+        # video (chosen by gop_slice: 0 head, 1 tail, 2 uniform) and all
+        # three modalities come from those same GOPs. The three
+        # max_*_length values above are then derived from it and the
+        # per-GOP sampling rates, so nothing is truncated independently.
+        # ---------------------------------------------------------------
+        max_gops=None,
+        gop_slice=2,
+
+        # ---------------------------------------------------------------
         # Spatial resolution.
         # ---------------------------------------------------------------
         image_resolution=224,
@@ -92,6 +104,11 @@ class MSRVTT_Compressed_DataLoader(Dataset):
 
         self.max_words = max_words
 
+        if max_gops is not None:
+            max_iframe_length = max_gops * iframe_sampling_rate
+            max_residual_length = max(1, max_gops * residual_sampling_rate)
+            max_mv_length = max(1, max_gops * mv_sampling_rate)
+
         self.max_iframe_length = max_iframe_length
         self.max_residual_length = max_residual_length
         self.max_mv_length = max_mv_length
@@ -114,7 +131,17 @@ class MSRVTT_Compressed_DataLoader(Dataset):
             mv_sampling_rate=mv_sampling_rate,
 
             accumulate=accumulate,
+
+            max_gops=max_gops,
+            gop_slice=gop_slice,
         )
+
+        # A CSV with a `sentence` column (MSRVTT_JSFUSION_test.csv, or a
+        # validation CSV from make_msrvtt_val_split.py) fixes ONE query
+        # caption per video. It is used instead of a random caption, which
+        # makes evaluation deterministic and, for the JSFUSION file, the
+        # standard MSR-VTT 1k-A protocol.
+        self.csv_has_sentence = "sentence" in self.csv.columns
 
         # Same special-token convention as the original loader.
         self.SPECIAL_TOKEN = {
@@ -532,6 +559,50 @@ class MSRVTT_Compressed_DataLoader(Dataset):
             torch.from_numpy(mv_mask),
         )
 
+    def _get_compressed_video_or_empty(self, choice_video_ids):
+        """
+        _get_compressed_video, but a video that cannot be decoded yields
+        all-zero frames with all-zero masks instead of killing the run.
+
+        CoViAR normally reports an unreadable file as "no frames", which
+        already ends up as all-zero masks; this also covers the cases in
+        which it raises. The training and evaluation loops detect such
+        samples through their masks, exclude them and report their count.
+        """
+
+        try:
+
+            return self._get_compressed_video(
+                choice_video_ids
+            )
+
+        except Exception as error:
+
+            print(
+                "WARNING: failed to decode {}: {!r}".format(
+                    choice_video_ids, error
+                )
+            )
+
+            num_pairs = len(choice_video_ids)
+            res = self.compressedVideoExtractor.image_resolution
+
+            out = []
+
+            for length, channels in (
+                (self.max_iframe_length, 3),
+                (self.max_residual_length, 3),
+                (self.max_mv_length, 2),
+            ):
+                out.append(
+                    torch.zeros(num_pairs, length, channels, res, res)
+                )
+                out.append(
+                    torch.zeros(num_pairs, length, dtype=torch.long)
+                )
+
+            return tuple(out)
+
     # ==================================================================
     # DATASET ENTRY POINT
     # ==================================================================
@@ -555,6 +626,12 @@ class MSRVTT_Compressed_DataLoader(Dataset):
             )
 
             caption = None
+
+            if self.csv_has_sentence:
+
+                caption = str(
+                    self.csv["sentence"].values[idx]
+                )
 
         # ---------------------------------------------------------------
         # Text preprocessing.
@@ -584,7 +661,7 @@ class MSRVTT_Compressed_DataLoader(Dataset):
             mv,
             mv_mask,
 
-        ) = self._get_compressed_video(
+        ) = self._get_compressed_video_or_empty(
             choice_video_ids
         )
 

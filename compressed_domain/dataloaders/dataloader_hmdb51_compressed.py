@@ -51,6 +51,8 @@ class HMDB51_Compressed_DataLoader(MSRVTT_Compressed_DataLoader):
         image_resolution=224,
         gop_size=12,
         accumulate=True,
+        max_gops=None,
+        gop_slice=2,
     ):
         # The parent's __init__ reads MSR-VTT captions, which HMDB51 has none
         # of; only the attributes _get_compressed_video uses are set up here.
@@ -63,6 +65,12 @@ class HMDB51_Compressed_DataLoader(MSRVTT_Compressed_DataLoader):
         self.index = index.reset_index(drop=True)
 
         self.features_path = features_path
+        # Same shared temporal budget as the MSR-VTT loader: with max_gops set,
+        # the per-modality lengths follow from it and nothing is truncated.
+        if max_gops is not None:
+            max_iframe_length = max_gops * iframe_sampling_rate
+            max_residual_length = max(1, max_gops * residual_sampling_rate)
+            max_mv_length = max(1, max_gops * mv_sampling_rate)
         self.max_iframe_length = max_iframe_length
         self.max_residual_length = max_residual_length
         self.max_mv_length = max_mv_length
@@ -74,6 +82,8 @@ class HMDB51_Compressed_DataLoader(MSRVTT_Compressed_DataLoader):
             residual_sampling_rate=residual_sampling_rate,
             mv_sampling_rate=mv_sampling_rate,
             accumulate=accumulate,
+            max_gops=max_gops,
+            gop_slice=gop_slice,
         )
 
     def __len__(self):

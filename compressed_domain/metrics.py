@@ -7,12 +7,18 @@ import numpy as np
 import torch
 
 def compute_metrics(x):
-    sx = np.sort(-x, axis=1)
-    d = np.diag(-x)
-    d = d[:, np.newaxis]
-    ind = sx - d
-    ind = np.where(ind == 0)
-    ind = ind[1]
+    # x[i, j]: similarity of query i to candidate j; candidate i is query i's
+    # ground truth. `ind` is the 0-based rank of the ground truth: the number of
+    # other candidates scoring at least as high, so ties count against the model
+    # (a collapsed embedding space ranks last, not first) and there is always
+    # exactly one rank per query.
+    x = np.asarray(x)
+    if x.ndim != 2 or x.shape[0] != x.shape[1]:
+        raise ValueError("compute_metrics needs a square similarity matrix, got {}".format(x.shape))
+    if not np.isfinite(x).all():
+        raise ValueError("similarity matrix has {} non-finite values".format(int((~np.isfinite(x)).sum())))
+    d = np.diag(x)[:, np.newaxis]
+    ind = (x >= d).sum(axis=1) - 1
     metrics = {}
     metrics['R1'] = float(np.sum(ind == 0)) * 100 / len(ind)
     metrics['R5'] = float(np.sum(ind < 5)) * 100 / len(ind)

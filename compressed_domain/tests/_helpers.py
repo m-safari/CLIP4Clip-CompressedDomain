@@ -56,14 +56,14 @@ def task_config(visual_branches=None, **kwargs):
     return config
 
 
-def build_model(visual_branches=None, state_dict=None, seed=0):
+def build_model(visual_branches=None, state_dict=None, seed=0, **config):
     """A CPU, fp32 CLIP4ClipCompressed built on the tiny CLIP."""
     from modules.modeling import CLIP4ClipCompressed
 
     with patched_clip_config():
         torch.manual_seed(seed)
         model = CLIP4ClipCompressed.from_pretrained(
-            state_dict=state_dict, task_config=task_config(visual_branches))
+            state_dict=state_dict, task_config=task_config(visual_branches, **config))
     return model.float()
 
 

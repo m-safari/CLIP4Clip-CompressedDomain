@@ -43,6 +43,28 @@ def resolve_visual_branches(task_config):
     return tuple(branch for branch in VISUAL_BRANCHES if branch in requested)
 
 
+# How the frame embeddings of the built branches become one video embedding.
+#   "modality": mean over the frames of each modality, then mean over the
+#               modalities. Every modality weighs the same however many frames
+#               it contributes.
+#   "frame":    one mean over all frames of all modalities (the original
+#               behaviour); a modality's weight is its share of the frames.
+VISUAL_POOLINGS = ("modality", "frame")
+
+
+def resolve_visual_pooling(task_config):
+    pooling = getattr(task_config, "visual_pooling", None) or "modality"
+    if pooling not in VISUAL_POOLINGS:
+        raise ValueError("Unknown visual_pooling {!r}; valid values are {}".format(pooling, VISUAL_POOLINGS))
+    return pooling
+
+
+def _safe_normalize(x, eps=1e-6):
+    # Rows that are exactly zero (masked-out frames / absent modalities) stay
+    # zero instead of becoming NaN.
+    return x / x.norm(dim=-1, keepdim=True).clamp_min(eps)
+
+
 class _EmptyConfig(PretrainedConfig):
     """
     Placeholder config. `until_module.PreTrainedModel.__init__` requires a
@@ -109,10 +131,10 @@ class CLIP4ClipCompressed(CLIP4ClipPreTrainedModel):
 
     Visual branch: three independent CLIP-ViT encoders (I-frame, residual, motion
     vector) each produce one CLS embedding per frame, in the same joint space as
-    the text encoder. All frames from all three modalities are concatenated and
-    pooled with a single masked mean (meanP) -- exactly the pooling CLIP4Clip
-    already applies across frames of one modality, just applied across a longer,
-    mixed-modality frame sequence.
+    the text encoder. With `task_config.visual_pooling == "modality"` (default)
+    each modality's frames are mean-pooled first and the modality embeddings are
+    then averaged, so every modality has the same weight. With "frame", all
+    frames of all modalities share one masked mean (the original behaviour).
 
     Similarity: loose (cosine) similarity only. No tight/cross-attention path.
     Loss: CrossEn (the same symmetric contrastive loss as stock CLIP4Clip).
@@ -127,7 +149,7 @@ class CLIP4ClipCompressed(CLIP4ClipPreTrainedModel):
         iframe / residuals                            : (B, T, 3, H, W)
         mv                                             : (B, T, 2, H, W)
         *_mask                                         : (B, T)
-    with no extra "n_pair" dimension.
+    (an extra "n_pair" dimension after B is flattened into the batch).
     """
 
     def __init__(self, config, clip_state_dict, task_config):
@@ -197,6 +219,14 @@ class CLIP4ClipCompressed(CLIP4ClipPreTrainedModel):
             ).float()
             convert_weights(self.mv_encoder)
 
+        self.visual_pooling = resolve_visual_pooling(task_config)
+        show_log(task_config, "visual_pooling: {}".format(self.visual_pooling))
+
+        if getattr(task_config, "grad_checkpoint", False):
+            for encoder in (self.clip.visual, self.residual_encoder, self.mv_encoder):
+                if encoder is not None:
+                    encoder.transformer.grad_checkpointing = True
+
         self.loss_fct = CrossEn()
 
         self.apply(self.init_weights)
@@ -215,30 +245,43 @@ class CLIP4ClipCompressed(CLIP4ClipPreTrainedModel):
         sequence_hidden = sequence_hidden.view(bs_pair, -1, sequence_hidden.size(-1))
         return sequence_hidden
 
-    def _encode_modality(self, encoder, frames, video_frame):
+    def _encode_modality(self, encoder, frames, mask):
         """
         Run one modality's frames through its VisualTransformer and return one
         CLS embedding per frame, in the shared embed_dim space. Mirrors
-        CLIP.encode_image's post-processing (ln_post -> proj -> take CLS token),
+        CLIP.encode_image's post-processing (ln_post -> proj on the CLS token),
         generalized to any VisualTransformer instance.
+
+        Only real frames (mask == 1) are encoded; padded positions come out as
+        zero vectors and cost no encoder memory.
 
         frames: (..., T, C, H, W) -- any number of leading dims (batch, n_pair, ...)
         are flattened into one batch dim, the same way get_sequence_output flattens
         text's leading dims via .view(-1, last_dim).
-        Returns (B_flat, T, embed_dim).
+        mask:   (B_flat, T)
+        Returns (B_flat, T, embed_dim), float32.
         """
         frames = frames.contiguous().view(-1, *frames.shape[-4:])
-        b, t, c, h, w = frames.shape
-        frames = frames.view(b * t, c, h, w)
-        frames = frames.type(encoder.conv1.weight.dtype)
+        b, t = frames.shape[:2]
+        valid = mask.bool()
 
-        hidden = encoder(frames, video_frame=video_frame)          # (B*T, tokens, width)
-        hidden = encoder.ln_post(hidden) @ encoder.proj             # (B*T, tokens, embed_dim)
-        cls = hidden[:, 0, :].float()                                # (B*T, embed_dim)
-        cls = cls.view(b, t, -1)
-        return cls
+        out = torch.zeros(b, t, encoder.proj.shape[1], dtype=torch.float32, device=frames.device)
+        if valid.any():
+            x = frames[valid].type(encoder.conv1.weight.dtype)      # (N_valid, C, H, W)
+            hidden = encoder(x, video_frame=t)                       # (N_valid, tokens, width)
+            cls = encoder.ln_post(hidden[:, 0, :]) @ encoder.proj    # (N_valid, embed_dim)
+            out[valid] = cls.float()
+        return out
 
     def get_visual_output(self, iframe, iframe_mask, residuals, residuals_mask, mv, mv_mask):
+        """
+        Returns (visual_output, video_mask) to be pooled by pool_video():
+
+            visual_pooling == "modality": (B, M, D) one embedding per built
+                modality, and (B, M) = 1 where that modality has any real frame.
+            visual_pooling == "frame":    (B, T_total, D) one embedding per frame
+                of every built modality, and the concatenated frame masks.
+        """
         # Every modality is always passed in; only the branches this model was
         # built with are encoded. A dropped branch's frames are ignored.
         inputs = {
@@ -250,16 +293,32 @@ class CLIP4ClipCompressed(CLIP4ClipPreTrainedModel):
         features, masks = [], []
         for branch in self.visual_branches:
             encoder, frames, mask = inputs[branch]
-            features.append(self._encode_modality(encoder, frames, frames.shape[-4]))
             # Masks get the same leading-dim flattening as their frame tensors so the
             # two stay aligned (e.g. (B, n_pair, T) -> (B*n_pair, T)).
-            masks.append(mask.contiguous().view(-1, mask.shape[-1]))
+            mask = mask.contiguous().view(-1, mask.shape[-1])
+            feature = self._encode_modality(encoder, frames, mask)
+            if self.visual_pooling == "modality":
+                feature, mask = self._pool_frames(feature, mask)
+            features.append(feature)
+            masks.append(mask)
 
-        # All frames from all built modalities become one pooled set of "frames",
-        # the same way CLIP4Clip already pools frames within a single modality.
-        visual_output = torch.cat(features, dim=1)   # (B, T_total, D)
-        video_mask = torch.cat(masks, dim=1)         # (B, T_total)
+        visual_output = torch.cat(features, dim=1)
+        video_mask = torch.cat(masks, dim=1)
         return visual_output, video_mask
+
+    def valid_video_rows(self, iframe_mask, residuals_mask, mv_mask):
+        """
+        (B,) bool: True where a video has at least one real frame in a branch this
+        model was built with. False means the video failed to decode (or has no
+        frame of any built modality); it has no embedding and must be excluded.
+        """
+        masks = {"iframe": iframe_mask, "residual": residuals_mask, "mv": mv_mask}
+        valid = None
+        for branch in self.visual_branches:
+            mask = masks[branch]
+            has_frames = mask.contiguous().view(-1, mask.shape[-1]).sum(dim=-1) > 0
+            valid = has_frames if valid is None else (valid | has_frames)
+        return valid
 
     def get_sequence_visual_output(self, input_ids, token_type_ids, attention_mask,
                                     iframe, iframe_mask, residuals, residuals_mask, mv, mv_mask):
@@ -287,13 +346,26 @@ class CLIP4ClipCompressed(CLIP4ClipPreTrainedModel):
         video_out = torch.sum(visual_output, dim=1) / video_mask_un_sum
         return video_out
 
+    @staticmethod
+    def _pool_frames(frame_features, frame_mask):
+        """(B, T, D) frame embeddings of ONE modality -> ((B, 1, D), (B, 1))."""
+        mask = frame_mask.to(dtype=torch.float).unsqueeze(-1)
+        pooled = torch.sum(_safe_normalize(frame_features) * mask, dim=1) / mask.sum(dim=1).clamp_min(1.)
+        return pooled.unsqueeze(1), (frame_mask.sum(dim=1, keepdim=True) > 0).to(frame_mask.dtype)
+
+    def pool_video(self, visual_output, video_mask):
+        """
+        get_visual_output()'s result -> (B, D) L2-normalised video embeddings.
+        A video with nothing unmasked has no embedding and comes out as NaN;
+        callers exclude such videos (see valid_video_rows).
+        """
+        visual_output = _safe_normalize(visual_output.contiguous())
+        visual_output = self._mean_pooling_for_similarity_visual(visual_output, video_mask)
+        return visual_output / visual_output.norm(dim=-1, keepdim=True)
+
     def _loose_similarity(self, sequence_output, visual_output, attention_mask, video_mask):
         sequence_output = sequence_output.contiguous()
-        visual_output = visual_output.contiguous()
-
-        visual_output = visual_output / visual_output.norm(dim=-1, keepdim=True)
-        visual_output = self._mean_pooling_for_similarity_visual(visual_output, video_mask)
-        visual_output = visual_output / visual_output.norm(dim=-1, keepdim=True)
+        visual_output = self.pool_video(visual_output, video_mask)
 
         sequence_output = sequence_output.squeeze(1)
         sequence_output = sequence_output / sequence_output.norm(dim=-1, keepdim=True)

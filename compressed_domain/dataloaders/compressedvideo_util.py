@@ -12,6 +12,10 @@ from torchvision.transforms import (
 
 import coviar
 
+# CLIP's RGB statistics.
+CLIP_MEAN = (0.48145466, 0.4578275, 0.40821073)
+CLIP_STD = (0.26862954, 0.26130258, 0.27577711)
+
 
 class CompressedVideoExtractor:
     """
@@ -62,6 +66,11 @@ class CompressedVideoExtractor:
         residual_sampling_rate=3,
         mv_sampling_rate=3,
         accumulate=True,
+        max_gops=None,
+        gop_slice=2,
+        bgr_to_rgb=True,
+        normalize=True,
+        mv_clip=20.0,
     ):
         """
         Parameters
@@ -100,6 +109,27 @@ class CompressedVideoExtractor:
 
             False:
                 returns the original compressed representation.
+
+        max_gops : int or None
+            Temporal budget: at most this many GOPs are decoded per video,
+            and all three modalities are taken from the SAME GOPs, so they
+            always describe the same time span. None decodes every GOP.
+
+        gop_slice : int
+            Which GOPs are kept when a video has more than max_gops:
+            0 = first ones, 1 = last ones, 2 = uniformly spread.
+
+        bgr_to_rgb : bool
+            CoViAR returns I-frames and residuals in BGR channel order.
+            CLIP (and the CLIP-initialised residual encoder) expects RGB.
+
+        normalize : bool
+            Scale residuals and motion vectors to the same order of
+            magnitude as CLIP-normalised I-frames (see _preprocess_*).
+
+        mv_clip : float
+            Motion vectors are clamped to +-mv_clip pixels and divided by
+            it (the same +-20 px window CoViAR uses).
         """
 
         if iframe_sampling_rate != 1:
@@ -125,6 +155,25 @@ class CompressedVideoExtractor:
         self.mv_sampling_rate = mv_sampling_rate
 
         self.accumulate = accumulate
+
+        if max_gops is not None and max_gops <= 0:
+            raise ValueError("max_gops must be positive or None.")
+
+        if gop_slice not in (0, 1, 2):
+            raise ValueError("gop_slice must be 0, 1 or 2.")
+
+        self.max_gops = max_gops
+        self.gop_slice = gop_slice
+        self.bgr_to_rgb = bgr_to_rgb
+        self.normalize = normalize
+        self.mv_clip = float(mv_clip)
+
+        # Residuals are zero-centred differences of 0..255 pixels, so they
+        # are only divided by the scale CLIP applies to pixels (255 * std);
+        # no mean is subtracted.
+        self.residual_scale = 255.0 * torch.tensor(
+            CLIP_STD, dtype=torch.float32
+        ).view(3, 1, 1)
 
         # ---------------------------------------------------------------
         # I-frame preprocessing
@@ -159,10 +208,7 @@ class CompressedVideoExtractor:
             CenterCrop(size),
             lambda image: image.convert("RGB"),
             ToTensor(),
-            Normalize(
-                (0.48145466, 0.4578275, 0.40821073),
-                (0.26862954, 0.26130258, 0.27577711),
-            ),
+            Normalize(CLIP_MEAN, CLIP_STD),
         ])
 
     def _resize_and_crop_array(self, array):
@@ -341,6 +387,11 @@ class CompressedVideoExtractor:
             len(available_positions),
         )
 
+        # A single sample is taken from the middle of the GOP: the first
+        # P-frame carries almost no accumulated motion/residual.
+        if num_samples == 1:
+            return [int(available_positions[len(available_positions) // 2])]
+
         # Select approximately uniformly spaced positions.
         indices = np.linspace(
             0,
@@ -350,6 +401,30 @@ class CompressedVideoExtractor:
         )
 
         return available_positions[indices].tolist()
+
+    def _select_gops(self, num_gops):
+        """
+        Return the GOP indices decoded for a video with num_gops GOPs.
+
+        All modalities are sampled from these same GOPs, which keeps
+        them temporally aligned under a shared budget (max_gops).
+        """
+
+        if self.max_gops is None or num_gops <= self.max_gops:
+            return list(range(num_gops))
+
+        if self.gop_slice == 0:
+            return list(range(self.max_gops))
+
+        if self.gop_slice == 1:
+            return list(range(num_gops - self.max_gops, num_gops))
+
+        return np.linspace(
+            0,
+            num_gops - 1,
+            num=self.max_gops,
+            dtype=np.int64,
+        ).tolist()
 
     # ------------------------------------------------------------------
     # Individual CoViAR loading
@@ -409,7 +484,10 @@ class CompressedVideoExtractor:
         if iframe is None:
             return None
 
-        # CoViAR's output is image-like.
+        # CoViAR's output is image-like, in BGR channel order.
+        if self.bgr_to_rgb:
+            iframe = np.ascontiguousarray(iframe[..., ::-1])
+
         image = Image.fromarray(iframe)
 
         return self.iframe_transform(image)
@@ -418,12 +496,11 @@ class CompressedVideoExtractor:
         """
         Convert one residual representation to a tensor.
 
-        Residuals are NOT RGB images semantically.
-
-        We therefore do not apply RGB normalization here.
-
-        The exact numeric normalization of residuals should ultimately
-        match the residual encoder you train.
+        Residuals are signed, zero-centred pixel differences. They are
+        put in the I-frames' channel order and divided by the scale CLIP
+        applies to pixels (255 * std), so the CLIP-initialised residual
+        encoder sees inputs of the magnitude it was pretrained on. No
+        mean is subtracted.
 
         Returns:
             [3, H, W]
@@ -438,11 +515,20 @@ class CompressedVideoExtractor:
         # uint8 RGB pixels.
         residual = residual.astype(np.float32)
 
+        # Same channel order as the I-frames.
+        if self.bgr_to_rgb:
+            residual = np.ascontiguousarray(residual[..., ::-1])
+
         residual = self._resize_and_crop_array(residual)
 
-        return torch.from_numpy(
-            residual.transpose(2, 0, 1)
+        residual = torch.from_numpy(
+            np.ascontiguousarray(residual.transpose(2, 0, 1))
         ).float()
+
+        if self.normalize:
+            residual = residual / self.residual_scale
+
+        return residual
 
     def _preprocess_mv(self, mv):
         """
@@ -465,11 +551,23 @@ class CompressedVideoExtractor:
 
         mv = mv.astype(np.float32)
 
+        # Clamp to +-mv_clip pixels and scale to [-1, 1] BEFORE resizing,
+        # so a few huge accumulated vectors cannot dominate the bicubic
+        # interpolation.
+        if self.normalize:
+            mv = np.clip(mv, -self.mv_clip, self.mv_clip) / self.mv_clip
+
         mv = self._resize_and_crop_array(mv)
 
-        return torch.from_numpy(
-            mv.transpose(2, 0, 1)
+        mv = torch.from_numpy(
+            np.ascontiguousarray(mv.transpose(2, 0, 1))
         ).float()
+
+        if self.normalize:
+            # Bicubic interpolation can overshoot slightly.
+            mv = mv.clamp_(-1.0, 1.0)
+
+        return mv
 
     # ------------------------------------------------------------------
     # Main extraction function
@@ -529,7 +627,7 @@ class CompressedVideoExtractor:
         #
         # This is the fundamental difference from RawVideoExtractor.
         # ---------------------------------------------------------------
-        for gop_index in range(num_gops):
+        for gop_index in self._select_gops(num_gops):
 
             gop_length = self._get_gop_length(
                 num_frames,

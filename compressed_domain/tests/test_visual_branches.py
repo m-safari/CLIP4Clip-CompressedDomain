@@ -106,15 +106,28 @@ class EverySubsetTest(unittest.TestCase):
                     if any(n.startswith(ENCODER_PREFIX[b]) for b in subset) and n.endswith("conv1.weight"):
                         self.assertIsNotNone(p.grad, n)
                         self.assertTrue(torch.isfinite(p.grad).all(), n)
-                # The text tower is always trained.
+                # The model itself freezes nothing (main_task_retrieval.freeze_parameters does).
                 self.assertIsNotNone(model.clip.token_embedding.weight.grad)
 
-    def test_visual_sequence_length_matches_built_branches(self):
+    def test_modality_pooling_gives_one_embedding_per_built_branch(self):
+        batch = fake_batch(n_iframe=2, n_residual=3, n_mv=4)
+        for subset in ALL_SUBSETS:
+            with self.subTest(visual_branches=subset):
+                model = build_model(list(subset)).eval()
+                self.assertEqual(model.visual_pooling, "modality")
+                with torch.no_grad():
+                    visual, mask = model.get_visual_output(
+                        batch["iframe"], batch["iframe_mask"], batch["residuals"], batch["residuals_mask"],
+                        batch["mv"], batch["mv_mask"])
+                self.assertEqual(tuple(visual.shape[:2]), (3, len(subset)))
+                self.assertTrue(torch.equal(mask, torch.ones(3, len(subset), dtype=mask.dtype)))
+
+    def test_frame_pooling_sequence_length_matches_built_branches(self):
         batch = fake_batch(n_iframe=2, n_residual=3, n_mv=4)
         lengths = {"iframe": 2, "residual": 3, "mv": 4}
         for subset in ALL_SUBSETS:
             with self.subTest(visual_branches=subset):
-                model = build_model(list(subset)).eval()
+                model = build_model(list(subset), visual_pooling="frame").eval()
                 with torch.no_grad():
                     visual, mask = model.get_visual_output(
                         batch["iframe"], batch["iframe_mask"], batch["residuals"], batch["residuals_mask"],
@@ -210,9 +223,11 @@ class CommandLineTest(unittest.TestCase):
         # Only the stubs, and the modules that bound them, are dropped afterwards:
         # restoring all of sys.modules would also unload torch internals imported
         # lazily meanwhile, which torch cannot re-register.
-        stubbed = [name for name in ("mlflow", "coviar") if name not in sys.modules]
+        stubbed = [name for name in ("mlflow", "mlflow.pytorch", "coviar") if name not in sys.modules]
         for name in stubbed:
             sys.modules[name] = types.ModuleType(name)
+        if "mlflow" in stubbed:
+            sys.modules["mlflow"].__path__ = []       # so `import mlflow.pytorch` resolves to the stub
         before = set(sys.modules)
         try:
             import main_task_retrieval

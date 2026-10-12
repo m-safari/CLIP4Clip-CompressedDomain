@@ -13,6 +13,7 @@ from tqdm import tqdm
 import torch
 import torch.nn.functional as F
 from torch import nn
+from torch.utils.checkpoint import checkpoint
 
 
 _MODELS = {
@@ -261,8 +262,16 @@ class Transformer(nn.Module):
         self.width = width
         self.layers = layers
         self.resblocks = nn.Sequential(*[ResidualAttentionBlock(width, heads, attn_mask) for _ in range(layers)])
+        # Trade compute for memory: block activations are recomputed during
+        # backward instead of being stored. Off by default; outputs and
+        # gradients are unchanged.
+        self.grad_checkpointing = False
 
     def forward(self, x: torch.Tensor, video_frame=-1):
+        if self.grad_checkpointing and self.training and x.requires_grad:
+            for block in self.resblocks:
+                x = checkpoint(lambda t, block=block: block((t, video_frame))[0], x, use_reentrant=False)
+            return x
         return self.resblocks((x, video_frame))[0]
 
 
