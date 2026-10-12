@@ -23,3 +23,11 @@ benchmark_model/
 benchmark_output*/
 benchmark_videos/
 features/
+
+# Misc
+.agents/
+.gitignore.swp
+clip4clip.pdf
+compressed_domain/docs/
+skills-lock.json
+
