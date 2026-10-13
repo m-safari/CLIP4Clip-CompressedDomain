@@ -53,6 +53,8 @@ class HMDB51_Compressed_DataLoader(MSRVTT_Compressed_DataLoader):
         accumulate=True,
         max_gops=None,
         gop_slice=2,
+        cache_dir=None,
+        cache_min_free_gb=2.0,
     ):
         # The parent's __init__ reads MSR-VTT captions, which HMDB51 has none
         # of; only the attributes _get_compressed_video uses are set up here.
@@ -65,6 +67,8 @@ class HMDB51_Compressed_DataLoader(MSRVTT_Compressed_DataLoader):
         self.index = index.reset_index(drop=True)
 
         self.features_path = features_path
+        self.cache_dir = cache_dir
+        self.cache_min_free_gb = cache_min_free_gb
         # Same shared temporal budget as the MSR-VTT loader: with max_gops set,
         # the per-modality lengths follow from it and nothing is truncated.
         if max_gops is not None:

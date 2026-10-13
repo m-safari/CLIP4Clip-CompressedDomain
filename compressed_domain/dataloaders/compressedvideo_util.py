@@ -730,6 +730,45 @@ class CompressedVideoExtractor:
             "mv": mv,
         }
 
+    # ------------------------------------------------------------------
+    # Compact storage (decoded-video cache)
+    # ------------------------------------------------------------------
+
+    def cache_key(self):
+        """Everything that determines video_to_compressed_tensors' output for a given file."""
+        return "g{}_r{}_i{}_res{}_mv{}_acc{}_k{}_s{}_bgr{}_clip{}".format(
+            self.gop_size, self.image_resolution, self.iframe_sampling_rate, self.residual_sampling_rate,
+            self.mv_sampling_rate, int(self.accumulate), self.max_gops, self.gop_slice,
+            int(self.bgr_to_rgb), self.mv_clip)
+
+    def pack(self, data):
+        """
+        video_to_compressed_tensors' output as small integer arrays:
+
+            iframe    uint8  the RGB pixels (exact: normalisation is undone)
+            residuals int16  the signed pixel differences, rounded to 1 grey level
+            mv        int8   the clamped motion vectors, in steps of mv_clip / 127
+
+        Only defined for normalize=True. unpack() restores the float tensors;
+        I-frames are identical, residuals and motion vectors differ by at most
+        half a quantisation step (about 0.007 and 0.004 in model-input units).
+        """
+        mean = torch.tensor(CLIP_MEAN).view(1, 3, 1, 1)
+        std = torch.tensor(CLIP_STD).view(1, 3, 1, 1)
+        iframe = ((data["iframe"] * std + mean) * 255.0).round().clamp(0, 255).to(torch.uint8)
+        residuals = (data["residuals"] * self.residual_scale).round().clamp(-32768, 32767).to(torch.int16)
+        mv = (data["mv"] * 127.0).round().clamp(-127, 127).to(torch.int8)
+        return {"iframe": iframe.numpy(), "residuals": residuals.numpy(), "mv": mv.numpy()}
+
+    def unpack(self, packed):
+        mean = torch.tensor(CLIP_MEAN).view(1, 3, 1, 1)
+        std = torch.tensor(CLIP_STD).view(1, 3, 1, 1)
+        return {
+            "iframe": (torch.from_numpy(packed["iframe"]).float() / 255.0 - mean) / std,
+            "residuals": torch.from_numpy(packed["residuals"]).float() / self.residual_scale,
+            "mv": torch.from_numpy(packed["mv"]).float() / 127.0,
+        }
+
     def _stack_or_empty(self, samples, channels):
         """
         Stack a list of [C,H,W] tensors into [N,C,H,W].

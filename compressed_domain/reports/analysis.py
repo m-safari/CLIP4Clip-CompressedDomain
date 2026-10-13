@@ -281,6 +281,86 @@ def plot_learning_curves(runs, metrics, titles=None, ncols=2, xlabel="optimizer 
     return fig, axes
 
 
+def epoch_metrics_table(run, prefix="val"):
+    """
+    One row per evaluated epoch: R@1 / R@5 / R@10, median rank and mean rank in
+    both directions, from the run's mlflow history.
+    """
+    columns = {}
+    for direction in ("t2v", "v2t"):
+        for key, label in (("R1", "R@1"), ("R5", "R@5"), ("R10", "R@10"), ("MedianR", "MedR"), ("MeanR", "MeanR")):
+            steps, values = metric_history(run, "{}_{}_{}".format(prefix, direction, key))
+            if len(steps):
+                columns["{}_{}".format(direction, label)] = pd.Series(values, index=steps)
+    if not columns:
+        return pd.DataFrame()
+    table = pd.DataFrame(columns).sort_index()
+    table.index.name = "step"
+    epoch_steps, epochs = metric_history(run, "epoch")
+    lookup = dict(zip(epoch_steps.tolist(), epochs.tolist()))
+    # Runs logged before the "epoch" metric existed: evaluations are numbered in order.
+    table.insert(0, "epoch", [int(lookup.get(step, i + 1)) for i, step in enumerate(table.index)])
+    return table.reset_index().set_index("epoch")
+
+
+def plot_epoch_metrics(run, prefix="val", title=None):
+    """
+    How retrieval changes after each epoch, for one run.
+
+    Rows: text-to-video, video-to-text. Columns: recall (R@1, R@5, R@10 share one
+    percentage axis), median rank, mean rank. The three quantities have
+    different scales, so each has its own panel rather than a second y-axis.
+    Recall: higher is better. Ranks: lower is better.
+    """
+    table = epoch_metrics_table(run, prefix)
+    fig, axes = plt.subplots(2, 3, figsize=(13, 6.2), squeeze=False, facecolor=SURFACE)
+    recall_colors = {"R@1": "#0d366b", "R@5": "#3987e5", "R@10": "#86b6ef"}       # one hue, darker = stricter
+    names = {"t2v": "Text-to-video", "v2t": "Video-to-text"}
+    for row, direction in enumerate(("t2v", "v2t")):
+        ax_recall, ax_median, ax_mean = axes[row]
+        for ax in axes[row]:
+            style_axes(ax)
+            ax.set_xlabel("epoch")
+        if len(table) == 0:
+            for ax in axes[row]:
+                ax.text(0.5, 0.5, "not logged", transform=ax.transAxes, ha="center", va="center", color=MUTED)
+            continue
+        epochs = table.index.to_numpy()
+        for label, color in recall_colors.items():
+            column = "{}_{}".format(direction, label)
+            if column not in table:
+                continue
+            values = table[column].to_numpy(dtype=float)
+            ax_recall.plot(epochs, values, color=color, linewidth=2, marker="o", markersize=6, label=label)
+            ax_recall.annotate("{}  {:.1f}".format(label, values[-1]), (epochs[-1], values[-1]),
+                               xytext=(8, 0), textcoords="offset points", va="center", fontsize=9, color=MUTED)
+        ax_recall.set_ylabel("recall (%)")
+        ax_recall.set_ylim(0, 100)
+        ax_recall.set_title("{}: recall (higher is better)".format(names[direction]), loc="left", fontsize=11)
+
+        for ax, label, what in ((ax_median, "MedR", "median rank"), (ax_mean, "MeanR", "mean rank")):
+            column = "{}_{}".format(direction, label)
+            if column in table:
+                values = table[column].to_numpy(dtype=float)
+                ax.plot(epochs, values, color=SERIES[0], linewidth=2, marker="o", markersize=6)
+                for x, y in zip(epochs, values):
+                    ax.annotate("{:.1f}".format(y), (x, y), xytext=(0, 7), textcoords="offset points",
+                                ha="center", fontsize=8, color=MUTED)
+                ax.set_ylim(0, max(float(np.nanmax(values)) * 1.25, 2.0))
+            ax.set_ylabel(what)
+            ax.set_title("{}: {} (lower is better)".format(names[direction], what), loc="left", fontsize=11)
+
+        for ax in axes[row]:
+            if len(table):
+                ax.set_xticks(table.index.to_numpy())
+                ax.set_xlim(table.index.min() - 0.3, table.index.max() + 0.9 if ax is ax_recall else
+                            table.index.max() + 0.3)
+    fig.suptitle(title or "{}: validation retrieval after each epoch".format(run["name"]),
+                 x=0.01, ha="left", fontsize=12, color=INK)
+    fig.tight_layout()
+    return fig, axes
+
+
 def plot_branch_curves(run, metric="val_t2v_R1", title=None):
     """One run: validation retrieval of the full model and of each branch alone, over training."""
     fig, ax = plt.subplots(figsize=(8, 3.6), facecolor=SURFACE)

@@ -7,6 +7,7 @@ groups, text freezing, retrieval metrics, the epoch sampler and batch trimming.
 
 CoViAR and mlflow are stubbed; nothing is downloaded or decoded.
 """
+import os
 import sys
 import types
 import unittest
@@ -113,6 +114,96 @@ class PreprocessingTest(unittest.TestCase):
         self.assertEqual(gops[0], [0, 9, 19, 29])
         self.assertEqual(gops[1], gops[0])
         self.assertEqual(gops[2], gops[0])
+
+
+class DecodedVideoCacheTest(unittest.TestCase):
+
+    def setUp(self):
+        import shutil
+        import tempfile
+        from dataloaders.dataloader_msrvtt_compressed import MSRVTT_Compressed_DataLoader
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp)
+        self.calls = []
+
+        def load(path, gop, pos, representation, accumulate):
+            self.calls.append((representation, gop, pos))
+            rng = np.random.default_rng(gop * 31 + pos * 7 + representation)
+            if representation == CompressedVideoExtractor.IFRAME:
+                return rng.integers(0, 256, (48, 64, 3)).astype(np.uint8)
+            if representation == CompressedVideoExtractor.MV:
+                return rng.integers(-60, 61, (48, 64, 2)).astype(np.int32)
+            return rng.integers(-255, 256, (48, 64, 3)).astype(np.int32)
+
+        self.frames = 12 * 5
+        fake = types.SimpleNamespace(get_num_frames=lambda path: self.frames, load=load)
+        patcher = mock.patch.object(compressedvideo_util, "coviar", fake)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+        self.dataset = MSRVTT_Compressed_DataLoader.__new__(MSRVTT_Compressed_DataLoader)
+        self.dataset.compressedVideoExtractor = CompressedVideoExtractor(
+            image_resolution=32, max_gops=3, residual_sampling_rate=1, mv_sampling_rate=1)
+        self.dataset.cache_dir = os.path.join(self.tmp, "cache")
+        self.dataset.cache_min_free_gb = 0.0
+
+    def test_pack_unpack_round_trip(self):
+        extractor = self.dataset.compressedVideoExtractor
+        data = extractor.video_to_compressed_tensors("x.mp4")
+        restored = extractor.unpack(extractor.pack(data))
+        for key in ("iframe", "residuals", "mv"):
+            self.assertEqual(restored[key].shape, data[key].shape)
+            self.assertEqual(restored[key].dtype, torch.float32)
+        torch.testing.assert_close(restored["iframe"], data["iframe"], rtol=0, atol=1e-5)       # exact pixels
+        self.assertLess(float((restored["residuals"] - data["residuals"]).abs().max()), 0.5 / (255 * 0.26) + 1e-6)
+        self.assertLess(float((restored["mv"] - data["mv"]).abs().max()), 0.5 / 127 + 1e-6)
+
+    def test_second_read_comes_from_the_cache(self):
+        first = self.dataset._extract("x.mp4", "video7")
+        decoded = len(self.calls)
+        self.assertEqual(decoded, 9)
+        second = self.dataset._extract("x.mp4", "video7")
+        self.assertEqual(len(self.calls), decoded)                    # CoViAR not called again
+        torch.testing.assert_close(second["iframe"], first["iframe"], rtol=0, atol=1e-5)
+        torch.testing.assert_close(second["mv"], first["mv"], rtol=0, atol=0.5 / 127 + 1e-6)
+        files = [f for _, _, names in os.walk(self.dataset.cache_dir) for f in names]
+        self.assertEqual(files, ["video7.npz"])
+
+    def test_cache_is_keyed_by_the_sampling_settings(self):
+        self.dataset._extract("x.mp4", "video7")
+        decoded = len(self.calls)
+        self.dataset.compressedVideoExtractor = CompressedVideoExtractor(
+            image_resolution=32, max_gops=2, residual_sampling_rate=1, mv_sampling_rate=1)
+        out = self.dataset._extract("x.mp4", "video7")
+        self.assertGreater(len(self.calls), decoded)                  # different settings: decoded afresh
+        self.assertEqual(out["iframe"].shape[0], 2)
+
+    def test_nothing_is_written_when_the_disk_is_nearly_full_or_decoding_failed(self):
+        self.dataset.cache_min_free_gb = 1e9
+        self.dataset._extract("x.mp4", "video7")
+        self.frames = 0
+        self.dataset.cache_min_free_gb = 0.0
+        empty = self.dataset._extract("broken.mp4", "video8")
+        self.assertEqual(empty["iframe"].shape[0], 0)
+        self.assertEqual([f for _, _, names in os.walk(self.dataset.cache_dir) for f in names], [])
+
+    def test_corrupt_cache_file_is_replaced(self):
+        self.dataset._extract("x.mp4", "video7")
+        path = [os.path.join(r, f) for r, _, names in os.walk(self.dataset.cache_dir) for f in names][0]
+        with open(path, "wb") as f:
+            f.write(b"not an npz")
+        decoded = len(self.calls)
+        out = self.dataset._extract("x.mp4", "video7")
+        self.assertGreater(len(self.calls), decoded)
+        self.assertEqual(out["iframe"].shape[0], 3)
+        self.dataset._extract("x.mp4", "video7")                      # and the rewritten file is valid
+        self.assertEqual(len(self.calls), decoded + 9)
+
+    def test_no_cache_dir_means_no_files(self):
+        self.dataset.cache_dir = None
+        self.dataset._extract("x.mp4", "video7")
+        self.dataset._extract("x.mp4", "video7")
+        self.assertEqual(len(self.calls), 18)
 
 
 class PoolingTest(unittest.TestCase):

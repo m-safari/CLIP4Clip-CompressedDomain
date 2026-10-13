@@ -48,6 +48,12 @@ def get_args(description='CLIP4Clip on Retrieval Task (single-GPU, MSRVTT)'):
     parser.add_argument('--features_path', type=str, default='data/videos_feature.pickle', help='feature path')
 
     parser.add_argument('--num_thread_reader', type=int, default=4, help='DataLoader worker processes')
+    parser.add_argument('--cache_dir', type=str, default=None,
+                        help='Directory for a cache of decoded videos. A video is decoded with CoViAR once and '
+                             'read back from here afterwards, which removes most of the CPU work of training. '
+                             'Safe to share between runs and to delete at any time.')
+    parser.add_argument('--cache_min_free_gb', type=float, default=2.0,
+                        help='Stop adding to the cache when its disk has less than this much free space.')
     parser.add_argument('--lr', type=float, default=0.0001, help='initial learning rate')
     parser.add_argument('--epochs', type=int, default=20, help='upper epoch limit')
     parser.add_argument('--batch_size', type=int, default=256, help='batch size')
@@ -368,9 +374,13 @@ def train_epoch(epoch, args, model, train_dataloader, device, optimizer, scaler,
     window_loss, window_batches = 0., 0
     failed_videos, skipped_batches = 0, 0
     grad_norm = float("nan")
+    data_time, batch_end = 0., time.time()
 
     optimizer.zero_grad(set_to_none=True)
     for step, batch in enumerate(train_dataloader):
+        # Time the training loop spent waiting for the dataloader. If this is
+        # most of Time/step, decoding (CPU) is the bottleneck, not the GPU.
+        data_time += time.time() - batch_end
         batch = tuple(t.to(device=device, non_blocking=True) for t in batch)
 
         # Videos that failed to decode have no frames and no embedding: drop them.
@@ -422,15 +432,16 @@ def train_epoch(epoch, args, model, train_dataloader, device, optimizer, scaler,
                 v_zero = optimizer_diagnostics(optimizer)
                 peak_gb = torch.cuda.max_memory_allocated() / 2 ** 30 if device.type == "cuda" else 0.
                 avg_loss = window_loss / max(window_batches, 1)
+                steps_in_window = log_step * args.gradient_accumulation_steps
                 logger.info("Epoch: %d/%s, Step: %d/%d, Lr: %s, Loss: %f, GradNorm: %.3f (%s), AdamV==0: %.1f%%, "
-                            "AmpScale: %g, PeakMem: %.2fGB, Time/step: %f", epoch + 1,
+                            "AmpScale: %g, PeakMem: %.2fGB, DataWait/step: %.3f, Time/step: %f", epoch + 1,
                             args.epochs, step + 1,
                             len(train_dataloader), "-".join([str('%.9f' % itm) for itm in lrs]),
                             avg_loss, grad_norm,
                             ", ".join("{} {:.2f}".format(k, v) for k, v in tower_norms.items()),
                             100 * v_zero, scaler.get_scale() if use_amp else 1.,
-                            peak_gb,
-                            (time.time() - start_time) / (log_step * args.gradient_accumulation_steps))
+                            peak_gb, data_time / steps_in_window,
+                            (time.time() - start_time) / steps_in_window)
                 mlflow.log_metrics({"grad_norm_" + k: (v if np.isfinite(v) else -1.)
                                     for k, v in tower_norms.items()}, step=global_step)
                 mlflow.log_metrics({
@@ -441,10 +452,15 @@ def train_epoch(epoch, args, model, train_dataloader, device, optimizer, scaler,
                     "adam_v_zero_frac": v_zero,
                     "amp_scale": scaler.get_scale() if use_amp else 1.,
                     "gpu_peak_gb": peak_gb,
+                    "data_wait_per_step": data_time / steps_in_window,
+                    "time_per_step": (time.time() - start_time) / steps_in_window,
                     "logit_scale": model.clip.logit_scale.exp().item(),
                 }, step=global_step)
                 window_loss, window_batches = 0., 0
+                data_time = 0.
                 start_time = time.time()
+
+        batch_end = time.time()
 
     if failed_videos or skipped_batches:
         logger.warning("Epoch %d: %d training videos failed to decode and were excluded; %d batches skipped.",

@@ -67,6 +67,8 @@ def _msrvtt_dataset(args, tokenizer, csv_path, unfold_sentences):
         mv_sampling_rate=args.mv_per_gop,
         max_gops=args.max_frames,
         gop_slice=args.slice_framepos,
+        cache_dir=getattr(args, "cache_dir", None),
+        cache_min_free_gb=getattr(args, "cache_min_free_gb", 2.0),
     )
 
 
@@ -83,6 +85,10 @@ def dataloader_msrvtt_train(args, tokenizer):
         pin_memory=True,
         drop_last=True,
         collate_fn=trim_padding_collate,
+        # Keep the decoding processes alive between epochs instead of
+        # starting them again (the sampler lives in the main process, so
+        # set_epoch still takes effect).
+        persistent_workers=args.num_thread_reader > 0,
     )
 
     return dataloader, len(sampler)

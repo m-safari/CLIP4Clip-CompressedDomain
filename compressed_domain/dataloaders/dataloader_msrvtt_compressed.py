@@ -1,6 +1,7 @@
 import os
 import json
 import random
+import shutil
 
 import numpy as np
 import pandas as pd
@@ -77,6 +78,12 @@ class MSRVTT_Compressed_DataLoader(Dataset):
         gop_slice=2,
 
         # ---------------------------------------------------------------
+        # Decoded-video cache (see _extract).
+        # ---------------------------------------------------------------
+        cache_dir=None,
+        cache_min_free_gb=2.0,
+
+        # ---------------------------------------------------------------
         # Spatial resolution.
         # ---------------------------------------------------------------
         image_resolution=224,
@@ -116,6 +123,9 @@ class MSRVTT_Compressed_DataLoader(Dataset):
         self.tokenizer = tokenizer
 
         self.unfold_sentences = unfold_sentences
+
+        self.cache_dir = cache_dir
+        self.cache_min_free_gb = cache_min_free_gb
 
         # ---------------------------------------------------------------
         # Create the compressed-video extractor.
@@ -472,11 +482,9 @@ class MSRVTT_Compressed_DataLoader(Dataset):
             # mv        -> [N_M, 2, H, W]
             # -----------------------------------------------------------
 
-            compressed_data = (
-                self.compressedVideoExtractor
-                .video_to_compressed_tensors(
-                    video_path
-                )
+            compressed_data = self._extract(
+                video_path,
+                video_id,
             )
 
             raw_iframe = compressed_data["iframe"]
@@ -558,6 +566,63 @@ class MSRVTT_Compressed_DataLoader(Dataset):
             torch.from_numpy(mv),
             torch.from_numpy(mv_mask),
         )
+
+    def _extract(self, video_path, video_id):
+        """
+        Decode one video's three modalities, through an optional disk cache.
+
+        Sampling is deterministic, so a video always decodes to the same
+        tensors; decoding it again every time one of its captions is drawn
+        is the main CPU cost of training. With cache_dir set, the first
+        decode is stored as small integer arrays (see
+        CompressedVideoExtractor.pack) and later reads skip CoViAR.
+
+        The cache is keyed by every sampling/preprocessing setting, so
+        changing one never serves stale data. Nothing is written once the
+        cache's filesystem has less than cache_min_free_gb free; those
+        videos are simply decoded each time, as without a cache.
+        """
+
+        extractor = self.compressedVideoExtractor
+        cache_dir = getattr(self, "cache_dir", None)
+
+        if not cache_dir or not extractor.normalize:
+            return extractor.video_to_compressed_tensors(video_path)
+
+        cache_file = os.path.join(
+            cache_dir,
+            extractor.cache_key(),
+            "{}.npz".format(video_id),
+        )
+
+        if os.path.exists(cache_file):
+            try:
+                with np.load(cache_file) as packed:
+                    return extractor.unpack(
+                        {key: packed[key] for key in ("iframe", "residuals", "mv")}
+                    )
+            except Exception:
+                # A truncated file (e.g. the machine stopped mid-write):
+                # fall through, decode and overwrite it.
+                pass
+
+        data = extractor.video_to_compressed_tensors(video_path)
+
+        # Failed decodes are not cached, so a repaired file is picked up.
+        if data["iframe"].shape[0] > 0:
+            try:
+                os.makedirs(os.path.dirname(cache_file), exist_ok=True)
+                free_gb = shutil.disk_usage(os.path.dirname(cache_file)).free / 2 ** 30
+                if free_gb >= getattr(self, "cache_min_free_gb", 2.0):
+                    # Written under a temporary name and renamed, so a reader
+                    # never sees a half-written file.
+                    tmp_file = "{}.{}.tmp.npz".format(cache_file, os.getpid())
+                    np.savez_compressed(tmp_file, **extractor.pack(data))
+                    os.replace(tmp_file, cache_file)
+            except OSError:
+                pass
+
+        return data
 
     def _get_compressed_video_or_empty(self, choice_video_ids):
         """
