@@ -118,7 +118,8 @@ def tokenize_prompts(prompts, tokenizer, max_words=32):
 # Model loading
 # ---------------------------------------------------------------------- #
 
-def load_variant(checkpoint, visual_branches=VISUAL_BRANCHES, device="cpu", pretrained_clip_name="ViT-B/32"):
+def load_variant(checkpoint, visual_branches=VISUAL_BRANCHES, device="cpu", pretrained_clip_name="ViT-B/32",
+                 residual_arch="vit", mv_arch="cnn", residual_layers=None, mv_layers=None):
     """
     Build a CLIP4ClipCompressed with the given visual branches and load a
     trained checkpoint (a state_dict saved by main_task_retrieval.save_model)
@@ -132,8 +133,11 @@ def load_variant(checkpoint, visual_branches=VISUAL_BRANCHES, device="cpu", pret
     state_dict = None
     if checkpoint is not None:
         state_dict = torch.load(checkpoint, map_location="cpu")
+    # residual_arch / mv_arch / *_layers must be the ones the checkpoint was trained with.
     task_config = types.SimpleNamespace(pretrained_clip_name=pretrained_clip_name,
-                                        visual_branches=list(visual_branches))
+                                        visual_branches=list(visual_branches),
+                                        residual_arch=residual_arch, mv_arch=mv_arch,
+                                        residual_layers=residual_layers, mv_layers=mv_layers)
     model = CLIP4ClipCompressed.from_pretrained(state_dict=state_dict, task_config=task_config)
     if torch.device(device).type == "cpu":
         model = model.float()    # CLIP keeps fp16 weights, which CPU kernels lack

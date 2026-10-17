@@ -10,6 +10,7 @@ from torch import nn
 from modules.until_module import PreTrainedModel, CrossEn
 from modules.until_config import PretrainedConfig
 from modules.module_clip import CLIP, VisualTransformer, convert_weights
+from modules.module_compact import CompactResNetEncoder
 
 logger = logging.getLogger(__name__)
 
@@ -53,6 +54,35 @@ VISUAL_POOLINGS = ("modality", "frame")
 
 # Initialisation of the motion-vector encoder (see from_pretrained).
 MV_INITS = ("random", "clip")
+
+# Architecture of the residual / motion-vector encoders (the I-frame tower is always CLIP's ViT).
+#   "vit":       a full copy of CLIP's visual tower (12 layers, ~88M parameters). The original.
+#   "vit_small": the same ViT cut to its first `<branch>_layers` blocks (default 4, ~31M).
+#                CLIP-initialisable: the patch embedding and the first blocks (low-level,
+#                edge-like features) transfer, which suits residuals.
+#   "cnn":       ResNet-18-style CNN (~11M), as CoViAR uses for residuals and motion vectors.
+#                No CLIP weights apply to it; it trains from scratch.
+# All three expose the interface _encode_modality needs, so inputs, outputs, pooling,
+# similarity and loss are identical whatever the choice.
+BRANCH_ARCHS = ("vit", "vit_small", "cnn")
+DEFAULT_SMALL_VIT_LAYERS = 4
+
+
+def resolve_branch_arch(task_config, branch, full_layers):
+    """(arch, n_transformer_layers) of the residual / mv encoder, from task_config.<branch>_arch / _layers."""
+    arch = getattr(task_config, branch + "_arch", None) or "vit"
+    if arch not in BRANCH_ARCHS:
+        raise ValueError("Unknown {}_arch {!r}; valid values are {}".format(branch, arch, BRANCH_ARCHS))
+    layers = full_layers
+    if arch == "vit_small":
+        layers = int(getattr(task_config, branch + "_layers", None) or DEFAULT_SMALL_VIT_LAYERS)
+        if not 1 <= layers <= full_layers:
+            raise ValueError("{}_layers must be in [1, {}], got {}".format(branch, full_layers, layers))
+    return arch, layers
+
+
+def _clip_visual_layers(clip_state_dict):
+    return len([k for k in clip_state_dict if k.startswith("visual.") and k.endswith(".attn.in_proj_weight")])
 
 
 def resolve_visual_pooling(task_config):
@@ -105,14 +135,34 @@ class CLIP4ClipPreTrainedModel(PreTrainedModel, nn.Module):
             if new_key not in state_dict:
                 state_dict[new_key] = val.clone()
 
-        # Residual branch: same 3-channel, 224x224 input shape as I-frames, so the
-        # pretrained CLIP visual weights transfer directly (shape-for-shape).
-        if "residual" in resolve_visual_branches(task_config):
+        # Keys the caller supplied, before the CLIP defaults below are filled in; used at the
+        # end to catch a checkpoint saved with a different residual / mv architecture.
+        supplied_keys = set(state_dict.keys())
+        branches = resolve_visual_branches(task_config)
+        full_layers = _clip_visual_layers(clip_state_dict)
+
+        def copy_clip_visual(prefix, layers, mv_conv1=False):
+            # CLIP's visual tower (its first `layers` transformer blocks) under `prefix`.
             for key, val in clip_state_dict.items():
-                if key.startswith("visual."):
-                    new_key = "residual_encoder." + key[len("visual."):]
-                    if new_key not in state_dict:
-                        state_dict[new_key] = val.clone()
+                if not key.startswith("visual."):
+                    continue
+                sub = key[len("visual."):]
+                if sub.startswith("transformer.resblocks.") and int(sub.split(".")[2]) >= layers:
+                    continue
+                new_key = prefix + sub
+                if new_key not in state_dict:
+                    if mv_conv1 and key == "visual.conv1.weight":
+                        val = val.mean(dim=1, keepdim=True).repeat(1, 2, 1, 1)
+                    state_dict[new_key] = val.clone()
+
+        # Residual branch: same 3-channel, 224x224 input shape as I-frames, so the
+        # pretrained CLIP visual weights transfer directly (shape-for-shape). With
+        # residual_arch == "vit_small" only the first residual_layers blocks are copied;
+        # with "cnn" there is nothing to copy.
+        if "residual" in branches:
+            arch, layers = resolve_branch_arch(task_config, "residual", full_layers)
+            if arch != "cnn":
+                copy_clip_visual("residual_encoder.", layers)
 
         # Motion-vector branch. By default it keeps its random initialization: its
         # 2-channel (dx, dy) input has no correspondence to RGB. With
@@ -120,23 +170,42 @@ class CLIP4ClipPreTrainedModel(PreTrainedModel, nn.Module):
         # CLIP's visual transformer is copied, and the 2-channel patch embedding is
         # the mean of CLIP's RGB filters (CoViAR likewise starts its motion-vector
         # network from image-pretrained weights). A checkpoint's own mv_encoder
-        # weights always take precedence.
+        # weights always take precedence. mv_init does not apply to the CNN.
         mv_init = getattr(task_config, "mv_init", None) or "random"
         if mv_init not in MV_INITS:
             raise ValueError("Unknown mv_init {!r}; valid values are {}".format(mv_init, MV_INITS))
-        if mv_init == "clip" and "mv" in resolve_visual_branches(task_config):
-            for key, val in clip_state_dict.items():
-                if key.startswith("visual."):
-                    new_key = "mv_encoder." + key[len("visual."):]
-                    if new_key not in state_dict:
-                        if key == "visual.conv1.weight":
-                            val = val.mean(dim=1, keepdim=True).repeat(1, 2, 1, 1)
-                        state_dict[new_key] = val.clone()
+        if "mv" in branches:
+            arch, layers = resolve_branch_arch(task_config, "mv", full_layers)
+            if mv_init == "clip":
+                if arch == "cnn":
+                    raise ValueError("mv_init='clip' needs a ViT motion-vector encoder (mv_arch vit or "
+                                     "vit_small); the CNN has no CLIP weights to start from.")
+                copy_clip_visual("mv_encoder.", layers, mv_conv1=True)
 
         config = _EmptyConfig()
         model = cls(config, clip_state_dict, task_config)
+        _check_branch_arch_matches(model, state_dict, supplied_keys)
         model = cls.init_preweight(model, state_dict, task_config=task_config)
         return model
+
+
+def _check_branch_arch_matches(model, state_dict, supplied_keys):
+    """
+    init_preweight only logs weights that do not fit, it does not fail, so a checkpoint saved with
+    another residual / mv architecture would silently leave that branch at its random init. Refuse it.
+    Only keys the caller supplied are checked; CLIP defaults filled in by from_pretrained always fit.
+    """
+    model_state = model.state_dict()
+    for branch, prefix in (("residual", "residual_encoder."), ("mv", "mv_encoder.")):
+        unexpected = sorted(k for k in supplied_keys if k.startswith(prefix) and k not in model_state)
+        mismatched = sorted(k for k in supplied_keys
+                            if k in model_state and k.startswith(prefix) and state_dict[k].shape != model_state[k].shape)
+        if unexpected or mismatched:
+            raise ValueError(
+                "The checkpoint's {0} encoder does not match the model being built ({1} unexpected keys, "
+                "{2} shape mismatches; e.g. {3}). It was probably trained with a different --{0}_arch or "
+                "--{0}_layers: pass the same values here.".format(
+                    branch, len(unexpected), len(mismatched), (unexpected + mismatched)[0]))
 
 
 def show_log(task_config, info):
@@ -217,25 +286,27 @@ class CLIP4ClipCompressed(CLIP4ClipPreTrainedModel):
 
         vision_heads = vision_width // 64
 
-        # --- Residual encoder: same architecture/channels as I-frame branch, own weights ---
-        self.residual_encoder = None
-        if "residual" in self.visual_branches:
-            self.residual_encoder = VisualTransformer(
-                input_resolution=image_resolution, patch_size=vision_patch_size, width=vision_width,
-                layers=vision_layers, heads=vision_heads, output_dim=embed_dim,
-                linear_patch='2d', input_channels=3,
-            ).float()
-            convert_weights(self.residual_encoder)
+        # --- Residual / motion-vector encoders: any of BRANCH_ARCHS, own weights ---
+        # Residual: 3-channel input like the I-frames (CLIP-initialised unless "cnn").
+        # Motion vector: 2-channel (dx, dy) input, random init unless mv_init == "clip".
+        def build_encoder(branch, input_channels):
+            arch, layers = resolve_branch_arch(task_config, branch, vision_layers)
+            if arch == "cnn":
+                encoder = CompactResNetEncoder(input_channels=input_channels, output_dim=embed_dim).float()
+            else:
+                encoder = VisualTransformer(
+                    input_resolution=image_resolution, patch_size=vision_patch_size, width=vision_width,
+                    layers=layers, heads=vision_heads, output_dim=embed_dim,
+                    linear_patch='2d', input_channels=input_channels,
+                ).float()
+            convert_weights(encoder)
+            show_log(task_config, "{} encoder: {}{}, {:.1f}M parameters".format(
+                branch, arch, " ({} layers)".format(layers) if arch != "cnn" else "",
+                sum(p.numel() for p in encoder.parameters()) / 1e6))
+            return encoder
 
-        # --- Motion-vector encoder: 2-channel (dx, dy) input, trained from scratch ---
-        self.mv_encoder = None
-        if "mv" in self.visual_branches:
-            self.mv_encoder = VisualTransformer(
-                input_resolution=image_resolution, patch_size=vision_patch_size, width=vision_width,
-                layers=vision_layers, heads=vision_heads, output_dim=embed_dim,
-                linear_patch='2d', input_channels=2,
-            ).float()
-            convert_weights(self.mv_encoder)
+        self.residual_encoder = build_encoder("residual", 3) if "residual" in self.visual_branches else None
+        self.mv_encoder = build_encoder("mv", 2) if "mv" in self.visual_branches else None
 
         self.visual_pooling = resolve_visual_pooling(task_config)
         show_log(task_config, "visual_pooling: {}".format(self.visual_pooling))
@@ -247,7 +318,8 @@ class CLIP4ClipCompressed(CLIP4ClipPreTrainedModel):
         if getattr(task_config, "grad_checkpoint", False):
             for encoder in (self.clip.visual, self.residual_encoder, self.mv_encoder):
                 if encoder is not None:
-                    encoder.transformer.grad_checkpointing = True
+                    # ViTs checkpoint their transformer blocks, the CNN its stages.
+                    getattr(encoder, "transformer", encoder).grad_checkpointing = True
 
         self.loss_fct = CrossEn()
 

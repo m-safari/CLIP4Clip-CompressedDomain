@@ -14,7 +14,7 @@ from metrics import compute_metrics, branch_subset_similarity
 import time
 import argparse
 from modules.tokenization_clip import SimpleTokenizer as ClipTokenizer
-from modules.modeling import CLIP4ClipCompressed, VISUAL_BRANCHES, VISUAL_POOLINGS, MV_INITS
+from modules.modeling import CLIP4ClipCompressed, VISUAL_BRANCHES, VISUAL_POOLINGS, MV_INITS, BRANCH_ARCHS
 from modules.optimization import BertAdam
 
 from util import get_logger
@@ -120,8 +120,20 @@ def get_args(description='CLIP4Clip on Retrieval Task (single-GPU, MSRVTT)'):
     parser.add_argument("--mv_init", default="random", choices=MV_INITS,
                         help="random: motion-vector encoder trained from scratch. clip: start it from CLIP's "
                              "visual tower (2-channel patch embedding = mean of the RGB filters).")
+    parser.add_argument("--residual_arch", default="vit", choices=BRANCH_ARCHS,
+                        help="Residual encoder architecture. vit: full copy of CLIP's visual tower (12 layers, "
+                             "CLIP-initialised). vit_small: its first --residual_layers blocks (CLIP-initialised). "
+                             "cnn: ResNet-18-style CNN trained from scratch.")
+    parser.add_argument("--mv_arch", default="vit", choices=BRANCH_ARCHS,
+                        help="Motion-vector encoder architecture; same choices as --residual_arch. "
+                             "--mv_init clip only applies to vit / vit_small.")
+    parser.add_argument("--residual_layers", type=int, default=None,
+                        help="Transformer blocks of the residual encoder when --residual_arch vit_small (default 4).")
+    parser.add_argument("--mv_layers", type=int, default=None,
+                        help="Transformer blocks of the motion-vector encoder when --mv_arch vit_small (default 4).")
     parser.add_argument("--residual_coef_lr", type=float, default=None,
-                        help="LR multiplier of the residual encoder. Default: --coef_lr.")
+                        help="LR multiplier of the residual encoder. Default: --coef_lr, except for "
+                             "--residual_arch cnn (trained from scratch), where it is 1 (i.e. --lr).")
     parser.add_argument("--mv_coef_lr", type=float, default=1.,
                         help="LR multiplier of the motion-vector encoder. Default 1 (trains at --lr).")
     parser.add_argument("--eval_on", default=None, choices=["val", "test"],
@@ -152,6 +164,12 @@ def get_args(description='CLIP4Clip on Retrieval Task (single-GPU, MSRVTT)'):
             args.gradient_accumulation_steps))
     if not args.do_train and not args.do_eval:
         raise ValueError("At least one of `do_train` or `do_eval` must be True.")
+
+    # A from-scratch CNN must not inherit the tiny multiplier meant for fine-tuning CLIP weights.
+    if args.residual_arch == "cnn" and args.residual_coef_lr is None:
+        args.residual_coef_lr = 1.
+    if args.mv_init == "clip" and args.mv_arch == "cnn":
+        raise ValueError("--mv_init clip needs --mv_arch vit or vit_small; the CNN has no CLIP weights.")
 
     args.batch_size = int(args.batch_size / args.gradient_accumulation_steps)
 
