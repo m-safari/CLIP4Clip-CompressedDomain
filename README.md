@@ -17,6 +17,8 @@ packing, capacity planning and evaluation, and pulls in torch/transformers only
 when it has to encode something. It does not import the rest of the repository,
 and the model it runs is chosen through a registry rather than hardcoded.
 
+ActivityNet Captions preparation, training and evaluation are supported in the compressed domain; see [the ActivityNet guide](compressed_domain/ACTIVITYNET.md). Select it with `--datatype activitynet` (MSR-VTT remains the default).
+
 ---
 
 # The embedding database

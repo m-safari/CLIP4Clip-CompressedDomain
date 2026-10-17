@@ -22,18 +22,18 @@ from dataloaders.data_dataloaders import DATALOADER_DICT
 
 global logger
 
-# This script is hardcoded to a single GPU and the MSRVTT dataset.
-# All torch.distributed / DistributedDataParallel and multi-dataset
-# selection logic from the original has been removed.
-DATATYPE = "msrvtt"
+# This script uses a single device and selectable retrieval datasets.
+# DistributedDataParallel from the original has been removed.
 MLFLOW_EXPERIMENT_NAME = "clip4clip-compressed-domain"
 # Written to --output_dir when a training run starts; `--resume_model auto` reads it.
 RUN_ID_FILE = "last_run_id.txt"
 # model.clip parameters that belong to the text branch (see --freeze_text).
 TEXT_BRANCH_PREFIXES = ("token_embedding.", "positional_embedding", "transformer.", "ln_final.", "text_projection")
 
-def get_args(description='CLIP4Clip on Retrieval Task (single-GPU, MSRVTT)'):
+def get_args(description='Compressed-domain CLIP4Clip retrieval (MSR-VTT / ActivityNet)'):
     parser = argparse.ArgumentParser(description=description)
+    parser.add_argument('--datatype', default='msrvtt', choices=['msrvtt', 'activitynet'],
+                        help='Retrieval dataset (default: msrvtt)')
     parser.add_argument("--do_train", action='store_true', help="Whether to run training.")
     parser.add_argument("--do_eval", action='store_true', help="Whether to run eval on the dev set.")
 
@@ -44,8 +44,8 @@ def get_args(description='CLIP4Clip on Retrieval Task (single-GPU, MSRVTT)'):
                              'stays untouched during training.')
     parser.add_argument('--test_csv', type=str, default=None,
                         help='Held-out test CSV (MSRVTT_JSFUSION_test.csv). Only evaluated with --do_eval.')
-    parser.add_argument('--data_path', type=str, default='data/caption.pickle', help='data pickle file path')
-    parser.add_argument('--features_path', type=str, default='data/videos_feature.pickle', help='feature path')
+    parser.add_argument('--data_path', type=str, default='data/caption.pickle', help='MSR-VTT caption JSON or ActivityNet annotation JSON (prepared merged JSON recommended)')
+    parser.add_argument('--features_path', type=str, default='data/videos_feature.pickle', help='Directory of compressed MPEG-4 videos')
 
     parser.add_argument('--num_thread_reader', type=int, default=4, help='DataLoader worker processes')
     parser.add_argument('--lr', type=float, default=0.0001, help='initial learning rate')
@@ -170,6 +170,9 @@ def get_args(description='CLIP4Clip on Retrieval Task (single-GPU, MSRVTT)'):
         args.residual_coef_lr = 1.
     if args.mv_init == "clip" and args.mv_arch == "cnn":
         raise ValueError("--mv_init clip needs --mv_arch vit or vit_small; the CNN has no CLIP weights.")
+
+    if args.datatype == "activitynet" and args.expand_msrvtt_sentences:
+        raise ValueError("--expand_msrvtt_sentences is MSR-VTT-only; ActivityNet uses one paragraph per video")
 
     args.batch_size = int(args.batch_size / args.gradient_accumulation_steps)
 
@@ -751,8 +754,8 @@ def main():
     # train and eval
     ## ####################################
     if args.do_train:
-        val_dataloader, val_length = DATALOADER_DICT[DATATYPE]["val"](args, tokenizer)
-        train_dataloader, train_length = DATALOADER_DICT[DATATYPE]["train"](args, tokenizer)
+        val_dataloader, val_length = DATALOADER_DICT[args.datatype]["val"](args, tokenizer)
+        train_dataloader, train_length = DATALOADER_DICT[args.datatype]["train"](args, tokenizer)
         logger.info("***** Running val *****")
         logger.info("  Num examples = %d", val_length)
         logger.info("  Batch size = %d", args.batch_size_val)
@@ -849,7 +852,7 @@ def main():
         eval_on = args.eval_on or ("test" if args.test_csv else "val")
         if eval_on == "test" and not args.test_csv:
             raise ValueError("--eval_on test needs --test_csv.")
-        eval_dataloader, eval_length = DATALOADER_DICT[DATATYPE][eval_on](args, tokenizer)
+        eval_dataloader, eval_length = DATALOADER_DICT[args.datatype][eval_on](args, tokenizer)
         logger.info("***** Running %s *****", eval_on)
         logger.info("  Num examples = %d", eval_length)
         logger.info("  Batch size = %d", args.batch_size_val)

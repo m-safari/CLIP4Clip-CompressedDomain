@@ -119,3 +119,36 @@ def dataloader_msrvtt_test(args, tokenizer):
 DATALOADER_DICT = {}
 DATALOADER_DICT["msrvtt"] = {"train": dataloader_msrvtt_train, "val": dataloader_msrvtt_val,
                              "test": dataloader_msrvtt_test}
+
+
+def _activitynet_loader(args, tokenizer, subset):
+    from .dataloader_activitynet_compressed import ActivityNet_Compressed_DataLoader
+
+    dataset = ActivityNet_Compressed_DataLoader(
+        csv_path=getattr(args, subset + "_csv"), data_path=args.data_path,
+        features_path=args.features_path, tokenizer=tokenizer, subset=subset,
+        max_words=args.max_words, max_gops=args.max_frames, gop_slice=args.slice_framepos,
+        residual_sampling_rate=args.residual_per_gop, mv_sampling_rate=args.mv_per_gop)
+    train = subset == "train"
+    sampler = EpochSubsetSampler(len(dataset), args.max_train_samples, args.seed) if train else None
+    loader = DataLoader(dataset, batch_size=args.batch_size if train else args.batch_size_val,
+                        sampler=sampler, shuffle=False, num_workers=args.num_thread_reader,
+                        pin_memory=True, drop_last=train, collate_fn=trim_padding_collate)
+    return loader, len(sampler) if train else len(dataset)
+
+
+def dataloader_activitynet_train(args, tokenizer):
+    return _activitynet_loader(args, tokenizer, "train")
+
+
+def dataloader_activitynet_val(args, tokenizer):
+    return _activitynet_loader(args, tokenizer, "val")
+
+
+def dataloader_activitynet_test(args, tokenizer):
+    return _activitynet_loader(args, tokenizer, "test")
+
+
+DATALOADER_DICT["activitynet"] = {"train": dataloader_activitynet_train,
+                                  "val": dataloader_activitynet_val,
+                                  "test": dataloader_activitynet_test}
