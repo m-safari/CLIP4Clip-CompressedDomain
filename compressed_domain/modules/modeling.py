@@ -194,9 +194,13 @@ def _check_branch_arch_matches(model, state_dict, supplied_keys):
     init_preweight only logs weights that do not fit, it does not fail, so a checkpoint saved with
     another residual / mv architecture would silently leave that branch at its random init. Refuse it.
     Only keys the caller supplied are checked; CLIP defaults filled in by from_pretrained always fit.
+    A branch the model was built without is skipped: loading a full checkpoint into an ablated model
+    is supported, and that branch's weights are simply not used.
     """
     model_state = model.state_dict()
     for branch, prefix in (("residual", "residual_encoder."), ("mv", "mv_encoder.")):
+        if branch not in model.visual_branches:
+            continue
         unexpected = sorted(k for k in supplied_keys if k.startswith(prefix) and k not in model_state)
         mismatched = sorted(k for k in supplied_keys
                             if k in model_state and k.startswith(prefix) and state_dict[k].shape != model_state[k].shape)

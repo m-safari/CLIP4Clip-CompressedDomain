@@ -29,6 +29,53 @@ def compute_metrics(x):
     metrics["cols"] = [int(i) for i in list(ind)]
     return metrics
 
+def compute_metrics_multi(x, gt_index):
+    """
+    Text-to-video metrics when a video has several captions (MSVD).
+
+    x[i, j]: similarity of caption i to video j; gt_index[i] is caption i's
+    video. Same rank and tie rule as compute_metrics, which this equals when
+    x is square and gt_index is arange(N).
+    """
+    x = np.asarray(x)
+    gt_index = np.asarray(gt_index, dtype=np.int64)
+    if x.ndim != 2 or gt_index.shape != (x.shape[0],):
+        raise ValueError("compute_metrics_multi needs (N_text, N_video) similarities and N_text ground-truth "
+                         "indices, got {} and {}".format(x.shape, gt_index.shape))
+    if len(gt_index) and (gt_index.min() < 0 or gt_index.max() >= x.shape[1]):
+        raise ValueError("ground-truth video index out of range [0, {})".format(x.shape[1]))
+    if not np.isfinite(x).all():
+        raise ValueError("similarity matrix has {} non-finite values".format(int((~np.isfinite(x)).sum())))
+    d = x[np.arange(len(gt_index)), gt_index][:, np.newaxis]
+    ind = (x >= d).sum(axis=1) - 1
+    metrics = {}
+    metrics['R1'] = float(np.sum(ind == 0)) * 100 / len(ind)
+    metrics['R5'] = float(np.sum(ind < 5)) * 100 / len(ind)
+    metrics['R10'] = float(np.sum(ind < 10)) * 100 / len(ind)
+    metrics['MR'] = np.median(ind) + 1
+    metrics["MedianR"] = metrics['MR']
+    metrics["MeanR"] = np.mean(ind) + 1
+    metrics["cols"] = [int(i) for i in list(ind)]
+    return metrics
+
+
+def video_to_text_similarity(x, gt_index):
+    """
+    (N_video, N_video) video-to-text similarities from (N_text, N_video) ones,
+    for videos with several captions: entry [v, u] is video v's best score
+    over the captions of video u, as in CLIP4Clip's multi-sentence evaluation.
+    compute_metrics on the result gives the video-to-text metrics.
+    """
+    x = np.asarray(x)
+    gt_index = np.asarray(gt_index, dtype=np.int64)
+    out = np.full((x.shape[1], x.shape[1]), -np.inf, dtype=x.dtype)
+    for u in range(x.shape[1]):
+        rows = x[gt_index == u]
+        if len(rows):
+            out[:, u] = rows.max(axis=0)
+    return out
+
+
 def print_computed_metrics(metrics):
     r1 = metrics['R1']
     r5 = metrics['R5']

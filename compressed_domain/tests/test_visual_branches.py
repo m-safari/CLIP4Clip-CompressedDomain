@@ -207,6 +207,17 @@ class CheckpointIntoAblatedModelTest(unittest.TestCase):
                 dropped = [p for b, p in ENCODER_PREFIX.items() if b not in subset]
                 self.assertFalse([k for k in ablated_sd if any(k.startswith(p) for p in dropped)])
 
+    def test_checkpoint_of_another_branch_architecture_is_refused(self):
+        checkpoint = build_model(seed=1).state_dict()                  # ViT residual encoder
+        with self.assertRaisesRegex(ValueError, "residual encoder does not match"):
+            build_model(state_dict=dict(checkpoint), residual_arch="cnn")
+
+    def test_dropped_branch_is_not_checked(self):
+        # A CNN-residual checkpoint into a model without a residual branch: those weights are unused.
+        checkpoint = build_model(seed=1, residual_arch="cnn").state_dict()
+        ablated = build_model(["iframe", "mv"], state_dict=dict(checkpoint))
+        self.assertIsNone(ablated.residual_encoder)
+
     def test_ablated_checkpoint_round_trips(self):
         source = build_model(["residual", "mv"], seed=3)
         checkpoint = _perturbed(source.state_dict(), 0.5)

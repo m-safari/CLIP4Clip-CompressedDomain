@@ -10,5 +10,6 @@ requests
 pandas
 transformers
 kagglehub
+huggingface_hub
 matplotlib
 mlflow
