@@ -292,5 +292,56 @@ class ReportHelpersTest(unittest.TestCase):
         an.plot_branch_curves(self.run_)
 
 
+def multi_caption_embeddings(n_videos=20, captions_per_video=3, d=16, seed=0):
+    """MSVD-style embeddings: several captions per video, each close to its video's I-frame embedding."""
+    emb = synthetic_embeddings(n=n_videos, d=d, seed=seed)
+    rng = np.random.default_rng(seed + 1)
+    index = np.repeat(np.arange(n_videos), captions_per_video)
+    text = emb["branch_embeddings"][index, 0] + 0.3 * rng.standard_normal((len(index), d))
+    emb.update(text_embeddings=(text / np.linalg.norm(text, axis=1, keepdims=True)).astype(np.float32),
+               captions=np.asarray(["caption %d of video %d" % (i, v) for i, v in enumerate(index)]),
+               caption_video_index=index, branches=[str(b) for b in emb["branches"]])   # as load_embeddings
+    return emb
+
+
+@unittest.skipUnless(HAVE_PLOTTING, "needs matplotlib and pandas")
+class MultiCaptionReportHelpersTest(unittest.TestCase):
+
+    def setUp(self):
+        self.emb = multi_caption_embeddings()
+
+    def test_ranks_and_metrics_use_each_captions_video(self):
+        from metrics import compute_metrics_multi, video_to_text_similarity
+        sim, index = an.similarity(self.emb), self.emb["caption_video_index"]
+        self.assertEqual(sim.shape, (60, 20))
+        self.assertEqual((an.ranks(self.emb) - 1).tolist(), compute_metrics_multi(sim, index)["cols"])
+        v2t = compute_metrics(video_to_text_similarity(sim, index))
+        self.assertEqual((an.ranks(self.emb, direction="v2t") - 1).tolist(), v2t["cols"])
+        metrics = an.retrieval_metrics(self.emb, ["iframe"])
+        self.assertEqual(metrics["queries"], 60)
+        self.assertGreater(metrics["t2v_R@1"], 90)
+
+    def test_single_caption_embeddings_are_unchanged(self):
+        emb = synthetic_embeddings()
+        self.assertEqual(an.caption_video_index(emb).tolist(), list(range(40)))
+        self.assertEqual(an.first_caption_rows(emb).tolist(), list(range(40)))
+
+    def test_alignment_and_qualitative_tables(self):
+        self.assertEqual(an.first_caption_rows(self.emb).tolist(), list(range(0, 60, 3)))
+        self.assertGreater(an.branch_alignment_table(self.emb).loc["I-frame", "gap"], 0.5)
+        t2v = an.qualitative_text_to_video(self.emb, [4], top_k=3, branches=["iframe"])
+        self.assertEqual(t2v["ground truth"].iloc[0], "video1")
+        self.assertTrue(t2v[t2v["position"] == 1]["correct"].all())
+        v2t = an.qualitative_video_to_text(self.emb, [2], top_k=3, branches=["iframe"])
+        self.assertEqual(v2t["ground-truth caption"].iloc[0], "caption 6 of video 2")
+        self.assertTrue(v2t[v2t["position"] == 1]["correct"].all())
+
+    def test_figures_render(self):
+        an.branch_ablation_table(self.emb)
+        an.complementarity_table(self.emb, k=1)
+        an.plot_recall_curve(self.emb)
+        an.plot_similarity_heatmap(self.emb, n=10)
+
+
 if __name__ == "__main__":
     unittest.main()

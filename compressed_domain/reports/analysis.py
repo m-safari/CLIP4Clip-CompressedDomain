@@ -27,7 +27,8 @@ _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
-from metrics import compute_metrics, branch_subset_similarity  # noqa: E402
+from metrics import (  # noqa: E402
+    compute_metrics_multi, video_to_text_similarity, branch_subset_similarity)
 
 # ---------------------------------------------------------------------- #
 # Style: one palette for every figure
@@ -151,26 +152,56 @@ def branch_indices(emb, branches=None):
     return [emb["branches"].index(b) for b in branches]
 
 
+def caption_video_index(emb):
+    """
+    Row in video_ids of each caption's video. MSVD embeddings have several
+    captions per video and store it; otherwise caption i belongs to video i.
+    """
+    if "caption_video_index" in emb:
+        return np.asarray(emb["caption_video_index"], dtype=np.int64)
+    return np.arange(len(emb["text_embeddings"]))
+
+
+def first_caption_rows(emb):
+    """(N videos,) the row of each video's first caption, e.g. to show one caption per video."""
+    index = caption_video_index(emb)
+    rows = np.full(len(emb["video_ids"]), -1, dtype=np.int64)
+    for row in range(len(index) - 1, -1, -1):
+        rows[index[row]] = row
+    return rows
+
+
 def similarity(emb, branches=None):
     """(N captions, N videos) cosine similarity, using only `branches` (None = all built)."""
     return branch_subset_similarity(emb["text_embeddings"], emb["branch_embeddings"], emb["branch_mask"],
                                     branch_indices(emb, branches))
 
 
+def _direction_similarity(emb, branches, direction):
+    """
+    (queries, candidates) similarities and each query's ground-truth column.
+    t2v: captions x videos. v2t: videos x videos, a video scored against each
+    video's best caption (the CLIP4Clip convention; with one caption per video
+    this is just the transpose).
+    """
+    sim, index = similarity(emb, branches), caption_video_index(emb)
+    if direction == "v2t":
+        return video_to_text_similarity(sim, index), np.arange(sim.shape[1])
+    return sim, index
+
+
 def ranks(emb, branches=None, direction="t2v"):
     """1-based rank of the ground truth for every query (ties count against the model)."""
-    sim = similarity(emb, branches)
-    if direction == "v2t":
-        sim = sim.T
-    return (sim >= np.diag(sim)[:, None]).sum(axis=1)
+    sim, gt = _direction_similarity(emb, branches, direction)
+    return (sim >= sim[np.arange(len(gt)), gt][:, None]).sum(axis=1)
 
 
 def retrieval_metrics(emb, branches=None):
     """Both directions, as one flat dict."""
-    sim = similarity(emb, branches)
-    out = {"queries": sim.shape[0]}
-    for direction, matrix in (("t2v", sim), ("v2t", sim.T)):
-        m = compute_metrics(matrix)
+    out = {"queries": len(emb["text_embeddings"])}
+    for direction in ("t2v", "v2t"):
+        sim, gt = _direction_similarity(emb, branches, direction)
+        m = compute_metrics_multi(sim, gt)
         out.update({direction + "_R@1": m["R1"], direction + "_R@5": m["R5"], direction + "_R@10": m["R10"],
                     direction + "_MedR": float(m["MR"]), direction + "_MeanR": float(m["MeanR"])})
     return out
@@ -237,11 +268,13 @@ def branch_alignment_table(emb):
                 information has a gap near 0.
     """
     rows = []
+    index = caption_video_index(emb)
     for branch in emb["branches"]:
         sim = similarity(emb, [branch])
-        n = sim.shape[0]
-        matched = float(np.diag(sim).mean())
-        mismatched = float((sim.sum() - np.trace(sim)) / max(n * (n - 1), 1))
+        n_captions, n_videos = sim.shape
+        on_target = sim[np.arange(n_captions), index]
+        matched = float(on_target.mean())
+        mismatched = float((sim.sum() - on_target.sum()) / max(n_captions * (n_videos - 1), 1))
         rows.append({"branch": BRANCH_LABELS.get(branch, branch), "matched": matched, "mismatched": mismatched,
                      "gap": matched - mismatched})
     return pd.DataFrame(rows).set_index("branch")
@@ -447,13 +480,14 @@ def plot_recall_curve(emb, subsets=None, direction="t2v", max_k=100, title=None)
                 label=subset_label(subset) if len(subset) == 1 else "all: " + subset_label(subset))
     n = len(emb["video_ids"])
     ax.plot(ks, ks / n * 100, color=MUTED, linewidth=1, linestyle="--", label="chance")
+    n_queries = len(emb["text_embeddings"]) if direction == "t2v" else n
     ax.set_xscale("log")
     ax.set_xticks([1, 5, 10, 50, 100][: 5 if max_k >= 100 else 3], [1, 5, 10, 50, 100][: 5 if max_k >= 100 else 3])
     ax.set_xlabel("K")
     ax.set_ylabel("recall@K (%)")
     ax.set_ylim(0, 100)
     ax.set_title(title or "Recall@K, {} ({} queries)".format(
-        "text-to-video" if direction == "t2v" else "video-to-text", n), loc="left", fontsize=11)
+        "text-to-video" if direction == "t2v" else "video-to-text", n_queries), loc="left", fontsize=11)
     ax.legend(frameon=False, labelcolor=MUTED, loc="center left", bbox_to_anchor=(1.0, 0.5))
     fig.tight_layout()
     return fig, ax
@@ -485,9 +519,11 @@ def plot_similarity_heatmap(emb, n=30, branches=None, start=0, title=None):
     """
     Cosine similarity between n captions (rows) and their n videos (columns).
     The ground truth is the diagonal, so a model that works shows a dark
-    diagonal on a light background.
+    diagonal on a light background. With several captions per video, each
+    row is that video's first caption.
     """
-    sim = similarity(emb, branches)[start:start + n, start:start + n]
+    rows = first_caption_rows(emb)[start:start + n]
+    sim = similarity(emb, branches)[rows, start:start + n]
     fig, ax = plt.subplots(figsize=(7.5, 6.5), facecolor=SURFACE)
     image = ax.imshow(sim, cmap=SEQUENTIAL, aspect="equal", interpolation="nearest")
     cbar = fig.colorbar(image, ax=ax, shrink=0.8)
@@ -514,30 +550,35 @@ def qualitative_text_to_video(emb, query_indices, top_k=5, branches=None):
     """For each caption query: the top-k retrieved videos and where the right one ranks."""
     sim = similarity(emb, branches)
     r = ranks(emb, branches, "t2v")
+    index, first = caption_video_index(emb), first_caption_rows(emb)
     rows = []
     for q in query_indices:
         order = np.argsort(-sim[q], kind="stable")[:top_k]
         for position, v in enumerate(order, start=1):
-            rows.append({"query caption": emb["captions"][q], "ground truth": emb["video_ids"][q],
+            rows.append({"query caption": emb["captions"][q], "ground truth": emb["video_ids"][index[q]],
                          "ground-truth rank": int(r[q]), "position": position,
                          "retrieved video": emb["video_ids"][v],
-                         "retrieved video's caption": emb["captions"][v],
-                         "similarity": round(float(sim[q, v]), 3), "correct": bool(v == q)})
+                         "retrieved video's caption": emb["captions"][first[v]],
+                         "similarity": round(float(sim[q, v]), 3), "correct": bool(v == index[q])})
     return pd.DataFrame(rows)
 
 
 def qualitative_video_to_text(emb, query_indices, top_k=5, branches=None):
-    """For each video query: the top-k retrieved captions and where the right one ranks."""
+    """
+    For each video query: the top-k retrieved captions and where the right one
+    ranks (with several captions per video: where its best caption's video ranks).
+    """
     sim = similarity(emb, branches).T
     r = ranks(emb, branches, "v2t")
+    index, first = caption_video_index(emb), first_caption_rows(emb)
     rows = []
     for q in query_indices:
         order = np.argsort(-sim[q], kind="stable")[:top_k]
         for position, c in enumerate(order, start=1):
-            rows.append({"query video": emb["video_ids"][q], "ground-truth caption": emb["captions"][q],
+            rows.append({"query video": emb["video_ids"][q], "ground-truth caption": emb["captions"][first[q]],
                          "ground-truth rank": int(r[q]), "position": position,
                          "retrieved caption": emb["captions"][c],
-                         "similarity": round(float(sim[q, c]), 3), "correct": bool(c == q)})
+                         "similarity": round(float(sim[q, c]), 3), "correct": bool(index[c] == q)})
     return pd.DataFrame(rows)
 
 
@@ -586,7 +627,7 @@ def show_retrieved_videos(emb, query_index, features_path, top_k=5, branches=Non
         ax.set_yticks([])
         if frame is not None:
             ax.imshow(frame)
-        correct = v == query_index
+        correct = v == caption_video_index(emb)[query_index]
         for side in ax.spines.values():
             side.set_color(INK if correct else AXIS)
             side.set_linewidth(2.5 if correct else 1)
