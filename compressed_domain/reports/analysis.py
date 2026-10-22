@@ -19,7 +19,8 @@ import sys
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-from matplotlib.colors import LinearSegmentedColormap
+from matplotlib.colors import LinearSegmentedColormap, hsv_to_rgb
+
 
 # compressed_domain/ on the path, for metrics.py.
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -606,3 +607,93 @@ def plot_mlflow_learning_curves(run_id, metric_names=("train_loss", "val_t2v_R1"
     run = {"name": run_id, "run_id": run_id,
            "tracking_uri": tracking_uri or (client.tracking_uri if client is not None else None)}
     return plot_learning_curves([run], list(metric_names), ncols=1)
+
+
+def _as_list(x):
+    """Accept one frame (H, W, C), a list/tuple of frames, or a stacked array (N, H, W, C)."""
+    if isinstance(x, (list, tuple)):
+        return [np.asarray(f) for f in x]
+    x = np.asarray(x)
+    return list(x) if x.ndim == 4 else [x]
+
+
+def _make_axes(n, titles, default_title, figsize_per=(4, 3.2)):
+    fig, axes = plt.subplots(
+        1, n, figsize=(figsize_per[0] * n, figsize_per[1]),
+        squeeze=False, constrained_layout=True,
+    )
+    axes = axes[0]
+    if titles is None:
+        titles = [f"{default_title} {k}" for k in range(n)] if n > 1 else [default_title]
+    for ax, t in zip(axes, titles):
+        ax.set_title(t)
+        ax.axis("off")
+    return fig, axes
+
+
+def show_iframes(iframes, bgr=False, titles=None):
+    """iframes: one (H, W, 3) frame or a list of them, shown in a row. Set bgr=True for OpenCV frames."""
+    frames = _as_list(iframes)
+    fig, axes = _make_axes(len(frames), titles, "I-frame")
+
+    for ax, f in zip(axes, frames):
+        if bgr:
+            f = f[..., ::-1]
+        if f.dtype != np.uint8:
+            f = np.clip(f * (255 if f.max() <= 1.0 else 1), 0, 255).astype(np.uint8)
+        ax.imshow(f)
+    plt.show()
+
+
+def show_residuals(residuals, mode="shifted", bgr=False, titles=None):
+    """
+    residuals: one (H, W, 3) signed residual or a list of them, shown in a row.
+    mode:
+      "shifted" -> res + 128 (gray = zero residual)
+      "abs"     -> |res| with a shared robust normalization (black = zero residual)
+    """
+    frames = [f.astype(np.float32) for f in _as_list(residuals)]
+    if bgr:
+        frames = [f[..., ::-1] for f in frames]
+    if mode not in ("shifted", "abs"):
+        raise ValueError("mode must be 'shifted' or 'abs'")
+
+    if mode == "abs":
+        scale = np.percentile(np.concatenate([np.abs(f).ravel() for f in frames]), 99) + 1e-8
+
+    fig, axes = _make_axes(len(frames), titles, f"Residual ({mode})")
+    for ax, f in zip(axes, frames):
+        if mode == "shifted":
+            vis = np.clip(f + 128, 0, 255)
+        else:
+            vis = np.clip(np.abs(f) / scale * 255, 0, 255)
+        ax.imshow(vis.astype(np.uint8))
+    plt.show()
+
+
+def show_motion_vectors(mvs, mode="magnitude", cmap="jet", titles=None):
+    """
+    mvs: one (H, W, 2) array with channels (dx, dy), or a list of them, shown in a row.
+    mode:
+      "magnitude" -> heatmap of ||(dx, dy)|| with one shared scale + colorbar
+      "flow"      -> HSV: hue = direction, value = magnitude (shared scale)
+    """
+    frames = [f.astype(np.float32) for f in _as_list(mvs)]
+    mags = [np.sqrt(f[..., 0] ** 2 + f[..., 1] ** 2) for f in frames]
+    if mode not in ("magnitude", "flow"):
+        raise ValueError("mode must be 'magnitude' or 'flow'")
+
+    fig, axes = _make_axes(len(frames), titles, f"MV ({mode})")
+
+    if mode == "magnitude":
+        vmax = max(m.max() for m in mags) + 1e-8
+        for ax, m in zip(axes, mags):
+            im = ax.imshow(m, cmap=cmap, vmin=0, vmax=vmax)
+        fig.colorbar(im, ax=list(axes), fraction=0.03, pad=0.02, label="magnitude (px)")
+    else:
+        scale = np.percentile(np.concatenate([m.ravel() for m in mags]), 99) + 1e-8
+        for ax, f, m in zip(axes, frames, mags):
+            ang = (np.arctan2(f[..., 1], f[..., 0]) + np.pi) / (2 * np.pi)
+            hsv = np.stack([ang, np.ones_like(ang), np.clip(m / scale, 0, 1)], axis=-1)
+            ax.imshow(hsv_to_rgb(hsv))
+    plt.show()
