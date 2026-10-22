@@ -122,6 +122,10 @@ class ActivityNet_Compressed_DataLoader(MSRVTT_Compressed_DataLoader):
         self.missing_video_ids = [v for v in listed if v not in self.video_paths]
         self._video_ids = [v for v in listed if v in self.video_paths]
         self._captions = [paragraphs[v] for v in self._video_ids]
+        if not self._video_ids:
+            raise ValueError("ActivityNet {}: none of the {} videos of {} has a .mp4 under {}. Re-encode them with "
+                             "dataloaders/prepare_activitynet_dataset.py --subsets {}.".format(
+                                 subset, len(listed), CAPTION_FILES[subset], features_path, subset))
         if self.missing_video_ids:
             print("WARNING: ActivityNet {}: {} of {} videos have no .mp4 under {} and are skipped.".format(
                 subset, len(self.missing_video_ids), len(listed), features_path))

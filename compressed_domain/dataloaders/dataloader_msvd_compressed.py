@@ -109,6 +109,10 @@ class MSVD_Compressed_DataLoader(MSRVTT_Compressed_DataLoader):
         self.video_paths = {v: files[v] for v in listed if v in files}
         self.missing_video_ids = [v for v in listed if v not in files]
         self._video_ids = [v for v in listed if v in files]
+        if not self._video_ids:
+            raise ValueError("MSVD {}: none of the {} videos of {}_list.txt has a .mp4 under {}. Re-encode them "
+                             "with dataloaders/prepare_msvd_dataset.py.".format(
+                                 subset, len(listed), subset, features_path))
         if self.missing_video_ids:
             print("WARNING: MSVD {}: {} of {} videos have no .mp4 under {} and are skipped.".format(
                 subset, len(self.missing_video_ids), len(listed), features_path))

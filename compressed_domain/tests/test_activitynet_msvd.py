@@ -205,6 +205,12 @@ class ActivityNetDatasetTest(_TmpDirTest):
         with self.assertRaises(ValueError):
             self.dataset("test")
 
+    def test_a_subset_with_no_video_on_disk_is_an_error(self):
+        for path in self.videos.iterdir():
+            path.unlink()
+        with self.assertRaisesRegex(ValueError, "--subsets train"):
+            self.dataset("train")
+
 
 # ---------------------------------------------------------------------- #
 # Metrics
