@@ -13,7 +13,6 @@ import pandas as pd
 import torch
 from torch.utils.data import Dataset
 
-from .compressedvideo_util import CompressedVideoExtractor
 from .dataloader_msrvtt_compressed import MSRVTT_Compressed_DataLoader
 
 # (frames key, mask key) of each modality, in the model's argument order.
@@ -64,26 +63,20 @@ class HMDB51_Compressed_DataLoader(MSRVTT_Compressed_DataLoader):
             index = index[index["split{}".format(split)] == tag]
         self.index = index.reset_index(drop=True)
 
-        self.features_path = features_path
-        # Same shared temporal budget as the MSR-VTT loader: with max_gops set,
-        # the per-modality lengths follow from it and nothing is truncated.
-        if max_gops is not None:
-            max_iframe_length = max_gops * iframe_sampling_rate
-            max_residual_length = max(1, max_gops * residual_sampling_rate)
-            max_mv_length = max(1, max_gops * mv_sampling_rate)
-        self.max_iframe_length = max_iframe_length
-        self.max_residual_length = max_residual_length
-        self.max_mv_length = max_mv_length
-
-        self.compressedVideoExtractor = CompressedVideoExtractor(
-            gop_size=gop_size,
-            image_resolution=image_resolution,
+        # Same shared temporal budget and extractor as the MSR-VTT loader.
+        self._init_video_side(
+            features_path,
             iframe_sampling_rate=iframe_sampling_rate,
             residual_sampling_rate=residual_sampling_rate,
             mv_sampling_rate=mv_sampling_rate,
-            accumulate=accumulate,
+            max_iframe_length=max_iframe_length,
+            max_residual_length=max_residual_length,
+            max_mv_length=max_mv_length,
             max_gops=max_gops,
             gop_slice=gop_slice,
+            image_resolution=image_resolution,
+            gop_size=gop_size,
+            accumulate=accumulate,
         )
 
     def __len__(self):

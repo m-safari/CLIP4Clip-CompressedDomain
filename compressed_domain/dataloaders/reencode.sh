@@ -14,7 +14,7 @@ if [[ ! -d "${outdir}" ]]; then
 fi
 
 count=0
-for inname in "${indir}"/*.avi "${indir}"/*.mp4
+for inname in "${indir}"/*.avi "${indir}"/*.mp4 "${indir}"/*.mkv "${indir}"/*.webm
 do
         [ -e "$inname" ] || continue   # skip if glob didn't match anything
 

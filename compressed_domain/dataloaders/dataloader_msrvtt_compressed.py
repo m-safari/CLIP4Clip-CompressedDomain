@@ -11,6 +11,22 @@ from torch.utils.data import Dataset
 from .compressedvideo_util import CompressedVideoExtractor
 
 
+def index_video_files(features_path, extensions=(".mp4",)):
+    """
+    {file stem: path} of every video under features_path (recursively).
+
+    Only the re-encoded MPEG-4 files count by default: an original .avi /
+    .mkv left next to them is not something CoViAR can decode.
+    """
+    videos = {}
+    for root, _, files in os.walk(features_path):
+        for name in sorted(files):
+            stem, ext = os.path.splitext(name)
+            if ext.lower() in extensions:
+                videos.setdefault(stem, os.path.join(root, name))
+    return videos
+
+
 class MSRVTT_Compressed_DataLoader(Dataset):
     """
     MSR-VTT dataset loader for compressed-domain video-text learning.
@@ -73,32 +89,23 @@ class MSRVTT_Compressed_DataLoader(Dataset):
         self.csv = pd.read_csv(csv_path)
         self.data = json.load(open(json_path, "r"))
 
-        self.features_path = features_path
-        self.max_words = max_words
-
-        if max_gops is not None:
-            max_iframe_length = max_gops * iframe_sampling_rate
-            max_residual_length = max(1, max_gops * residual_sampling_rate)
-            max_mv_length = max(1, max_gops * mv_sampling_rate)
-
-        self.max_iframe_length = max_iframe_length
-        self.max_residual_length = max_residual_length
-        self.max_mv_length = max_mv_length
-
-        self.tokenizer = tokenizer
         self.unfold_sentences = unfold_sentences
 
-        # Create the compressed-video extractor.
-        # The extractor handles CoViAR and representation sampling.
-        self.compressedVideoExtractor = CompressedVideoExtractor(
-            gop_size=gop_size,
-            image_resolution=image_resolution,
+        self._init_video_side(
+            features_path=features_path,
+            tokenizer=tokenizer,
+            max_words=max_words,
             iframe_sampling_rate=iframe_sampling_rate,
             residual_sampling_rate=residual_sampling_rate,
             mv_sampling_rate=mv_sampling_rate,
-            accumulate=accumulate,
+            max_iframe_length=max_iframe_length,
+            max_residual_length=max_residual_length,
+            max_mv_length=max_mv_length,
             max_gops=max_gops,
             gop_slice=gop_slice,
+            image_resolution=image_resolution,
+            gop_size=gop_size,
+            accumulate=accumulate,
         )
 
         # A CSV with a `sentence` column (MSRVTT_JSFUSION_test.csv, or a
@@ -107,15 +114,6 @@ class MSRVTT_Compressed_DataLoader(Dataset):
         # makes evaluation deterministic and, for the JSFUSION file, the
         # standard MSR-VTT 1k-A protocol.
         self.csv_has_sentence = "sentence" in self.csv.columns
-
-        # Same special-token convention as the original loader.
-        self.SPECIAL_TOKEN = {
-            "CLS_TOKEN": "<|startoftext|>",
-            "SEP_TOKEN": "<|endoftext|>",
-            "MASK_TOKEN": "[MASK]",
-            "UNK_TOKEN": "[UNK]",
-            "PAD_TOKEN": "[PAD]",
-        }
 
         # Caption bookkeeping. MSR-VTT contains multiple captions per video.
         if self.unfold_sentences:
@@ -145,8 +143,85 @@ class MSRVTT_Compressed_DataLoader(Dataset):
             # One dataset item per CSV row.
             self.sample_len = len(self.csv)
 
+    def _init_video_side(
+        self,
+        features_path,
+        tokenizer=None,
+        max_words=30,
+        iframe_sampling_rate=1,
+        residual_sampling_rate=3,
+        mv_sampling_rate=3,
+        max_iframe_length=100,
+        max_residual_length=100,
+        max_mv_length=100,
+        max_gops=None,
+        gop_slice=2,
+        image_resolution=224,
+        gop_size=12,
+        accumulate=True,
+    ):
+        """
+        Everything _get_text and _get_compressed_video rely on, shared by
+        every compressed-domain dataset (MSR-VTT, MSVD, ActivityNet, HMDB51)
+        so a video reaches the model the same way whichever dataset it is from.
+        """
+        self.features_path = features_path
+        self.tokenizer = tokenizer
+        self.max_words = max_words
+
+        # With max_gops set, the per-modality lengths follow from it and the
+        # per-GOP sampling rates, so nothing is truncated independently.
+        if max_gops is not None:
+            max_iframe_length = max_gops * iframe_sampling_rate
+            max_residual_length = max(1, max_gops * residual_sampling_rate)
+            max_mv_length = max(1, max_gops * mv_sampling_rate)
+
+        self.max_iframe_length = max_iframe_length
+        self.max_residual_length = max_residual_length
+        self.max_mv_length = max_mv_length
+
+        # Create the compressed-video extractor.
+        # The extractor handles CoViAR and representation sampling.
+        self.compressedVideoExtractor = CompressedVideoExtractor(
+            gop_size=gop_size,
+            image_resolution=image_resolution,
+            iframe_sampling_rate=iframe_sampling_rate,
+            residual_sampling_rate=residual_sampling_rate,
+            mv_sampling_rate=mv_sampling_rate,
+            accumulate=accumulate,
+            max_gops=max_gops,
+            gop_slice=gop_slice,
+        )
+
+        # Same special-token convention as the original loader.
+        self.SPECIAL_TOKEN = {
+            "CLS_TOKEN": "<|startoftext|>",
+            "SEP_TOKEN": "<|endoftext|>",
+            "MASK_TOKEN": "[MASK]",
+            "UNK_TOKEN": "[UNK]",
+            "PAD_TOKEN": "[PAD]",
+        }
+
     def __len__(self):
         return self.sample_len
+
+    # ==================================================================
+    # EVALUATION BOOKKEEPING
+    #
+    # eval_epoch reads these instead of the CSV, so it works the same for
+    # every dataset. Row i of an evaluation pass is video_ids[i] queried by
+    # captions[i].
+    # ==================================================================
+
+    @property
+    def video_ids(self):
+        return np.asarray(self.csv["video_id"].values).astype(str)
+
+    @property
+    def captions(self):
+        if self.csv_has_sentence:
+            return np.asarray(self.csv["sentence"].values).astype(str)
+        return np.asarray([""] * len(self.csv))
 
     # ==================================================================
     # TEXT SIDE
@@ -222,6 +297,16 @@ class MSRVTT_Compressed_DataLoader(Dataset):
     # COMPRESSED VIDEO SIDE
     # ==================================================================
 
+    def _video_path(self, video_id):
+        """Where the re-encoded file of `video_id` is; datasets with another layout override this."""
+        video_path = os.path.join(self.features_path, "{}.mp4".format(video_id))
+
+        if not os.path.exists(video_path):
+            # Same .webm fallback used by the original loader.
+            video_path = video_path.replace(".mp4", ".webm")
+
+        return video_path
+
     def _get_compressed_video(self, choice_video_ids):
         """
         Load, truncate, pad and mask all three compressed modalities.
@@ -279,11 +364,7 @@ class MSRVTT_Compressed_DataLoader(Dataset):
 
         # Process each video-text pair independently.
         for i, video_id in enumerate(choice_video_ids):
-            video_path = os.path.join(self.features_path, "{}.mp4".format(video_id))
-
-            if not os.path.exists(video_path):
-                # Same .webm fallback used by the original loader.
-                video_path = video_path.replace(".mp4", ".webm")
+            video_path = self._video_path(video_id)
 
             # Extract compressed-domain sequences.
             #
