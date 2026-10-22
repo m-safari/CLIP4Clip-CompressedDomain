@@ -8,7 +8,7 @@ retrieval in the compressed domain. Upstream's full documentation is preserved
 
 | Component | Purpose |
 |---|---|
-| [`compressed_domain/`](compressed_domain/) | Compressed-domain dataloader and the three-stream `CLIP4ClipCompressed` model (I-frame, residual, motion vector) |
+| [`compressed_domain/`](compressed_domain/) | Compressed-domain dataloaders (MSR-VTT, MSVD, ActivityNet, HMDB51) and the three-stream `CLIP4ClipCompressed` model (I-frame, residual, motion vector). See [MSVD and ActivityNet](#msvd-and-activitynet-in-the-compressed-domain) |
 | [`compressed_domain/evaluate/`](compressed_domain/evaluate/) | Turns an MSR-VTT sample into a portable vector database, with capacity planning and vector packing |
 | [`rgb_domain/`](rgb_domain/) | CLIP4Clip training and evaluation, carried over from upstream |
 
@@ -176,6 +176,124 @@ python -m unittest discover -s tests -v
 - [`EMBEDDING_DB.md`](compressed_domain/evaluate/EMBEDDING_DB.md) — full module documentation
 - [`BENCHMARK_RESULTS.md`](compressed_domain/evaluate/BENCHMARK_RESULTS.md) — measurements, and the limits of each
 - [`sample_database/`](compressed_domain/evaluate/sample_database/) — the published vectors and split CSV
+
+---
+
+# MSVD and ActivityNet in the compressed domain
+
+`compressed_domain/main_task_retrieval.py` trains and evaluates on MSR-VTT,
+MSVD and ActivityNet, selected with `--datatype msrvtt | msvd | activity`. The
+command line follows upstream CLIP4Clip's (see [How to Run](#how-to-run)), with
+two differences:
+
+- **One GPU.** Run the script directly with `python`, not through
+  `torch.distributed.launch`. Upstream's `--loose_type`, `--linear_patch 2d`,
+  `--sim_header meanP` and `--local_rank` are accepted so its commands parse;
+  other values of the first three are rejected because this model doesn't
+  implement them. A launch with more than one process stops with an error.
+- **`--max_frames` counts GOPs** rather than frames: all three modalities are
+  sampled from that many GOPs, spread uniformly over the video with
+  `--slice_framepos 2`.
+
+Every command below runs from `compressed_domain/`.
+
+## Preparing the data
+
+Each prepare module downloads what it can, re-encodes the videos to CoViAR's
+MPEG-4 layout with `dataloaders/reencode.sh` (needs `ffmpeg`), and prints the
+`--data_path` and `--features_path` to use. A step whose output is already on
+disk is skipped.
+
+```bash
+python dataloaders/prepare_msvd_dataset.py --download-path /data/msvd
+```
+
+For MSVD, the splits and `raw-captions.pkl` come from upstream's
+`msvd_data.zip`, and the videos come from the Hugging Face mirror
+`friedrichor/MSVD`. Pass `--videos-dir` to use raw videos you already have.
+
+```bash
+python dataloaders/prepare_activitynet_dataset.py --download-path /data/activitynet --videos-dir /data/Activity_Videos
+```
+
+For ActivityNet, the official `train.json`, `val_1.json`, `train_ids.json` and
+`val_ids.json` come from the Hugging Face mirror
+`friedrichor/ActivityNet_Captions`. Videos come from `--videos-dir`, or from
+`--download-videos`, which downloads the mirror's ~42 GB video tar and needs
+about twice that in disk space. Only the val videos are re-encoded unless you
+pass `--subsets train val`. Videos that aren't found are listed in
+`missing_videos_<subset>.txt` and left out of training and evaluation.
+
+## Evaluating
+
+```bash
+DATA_PATH=/data/activitynet
+python main_task_retrieval.py --do_eval --num_thread_reader=2 \
+--data_path ${DATA_PATH}/activitynet_data \
+--features_path ${DATA_PATH}/mpeg4_videos \
+--output_dir ckpts/ckpt_activity_retrieval_looseType --resume_model auto \
+--max_words 64 --max_frames 64 --batch_size_val 16 \
+--datatype activity --slice_framepos 2 \
+--loose_type --linear_patch 2d --sim_header meanP \
+--pretrained_clip_name ViT-B/32
+```
+
+```bash
+DATA_PATH=/data/msvd
+python main_task_retrieval.py --do_eval --num_thread_reader=2 \
+--data_path ${DATA_PATH}/msvd_data \
+--features_path ${DATA_PATH}/mpeg4_videos \
+--output_dir ckpts/ckpt_msvd_retrieval_looseType --resume_model auto \
+--max_words 32 --max_frames 12 --batch_size_val 16 \
+--datatype msvd --slice_framepos 2 \
+--loose_type --linear_patch 2d --sim_header meanP \
+--pretrained_clip_name ViT-B/32
+```
+
+With `--resume_model auto`, the best checkpoint of the last training run in
+`--output_dir` is evaluated. To evaluate other weights, use
+`--init_model runs:/<run_id>/pytorch_model.best` or a local `.pt` path instead.
+If you pass neither, the untrained model (CLIP initialisation) is evaluated.
+
+- **ActivityNet** is paragraph-to-video retrieval. Each video's sentences are
+  joined into one paragraph and matched against the whole video. It is
+  evaluated on `val_1.json`, as in CLIP4Clip, because there is no test split.
+- **MSVD** is evaluated on `test_list.txt` by default (`--eval_on val` for
+  `val_list.txt`). Every caption is a query. Text-to-video ranks the caption's
+  video. Video-to-text scores each video by its best-matching caption, as
+  upstream does. Each video is decoded once, not once per caption. The saved
+  `embeddings_<split>.npz` has one text row per caption, plus
+  `caption_video_index`.
+
+## Training
+
+Replace `--do_eval --resume_model auto` with upstream's training flags. For
+example, this is upstream's ActivityNet command without the
+`torch.distributed.launch` prefix:
+
+```bash
+python main_task_retrieval.py --do_train --num_thread_reader=2 \
+--epochs=5 --batch_size=128 --n_display=50 \
+--data_path ${DATA_PATH}/activitynet_data \
+--features_path ${DATA_PATH}/mpeg4_videos \
+--output_dir ckpts/ckpt_activity_retrieval_looseType \
+--lr 1e-4 --max_words 64 --max_frames 64 --batch_size_val 16 \
+--datatype activity --feature_framerate 1 --coef_lr 1e-3 \
+--freeze_layer_num 0 --slice_framepos 2 \
+--loose_type --linear_patch 2d --sim_header meanP \
+--pretrained_clip_name ViT-B/32
+```
+
+The best checkpoint is chosen on the val split (`val_1.json` for ActivityNet,
+`val_list.txt` for MSVD). On one GPU, `--batch_size 128` with `--max_frames 64`
+probably needs `--gradient_accumulation_steps` or `--grad_checkpoint` to fit in
+memory.
+
+## Tests
+
+```bash
+cd compressed_domain && python -m unittest discover -s tests -v
+```
 
 ---
 
