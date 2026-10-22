@@ -10,7 +10,7 @@ import os
 import json
 import mlflow
 import mlflow.pytorch
-from metrics import compute_metrics, branch_subset_similarity
+from metrics import compute_metrics, compute_metrics_multi, video_to_text_similarity, branch_subset_similarity
 import time
 import argparse
 from modules.tokenization_clip import SimpleTokenizer as ClipTokenizer
@@ -22,30 +22,38 @@ from dataloaders.data_dataloaders import DATALOADER_DICT
 
 global logger
 
-# This script is hardcoded to a single GPU and the MSRVTT dataset.
-# All torch.distributed / DistributedDataParallel and multi-dataset
-# selection logic from the original has been removed.
-DATATYPE = "msrvtt"
+# This script runs on a single GPU. All torch.distributed /
+# DistributedDataParallel logic from the original has been removed; the
+# original's distributed and model-choice flags are still accepted (see
+# get_args) so its documented command lines run unchanged.
+DATATYPES = tuple(DATALOADER_DICT)
 MLFLOW_EXPERIMENT_NAME = "clip4clip-compressed-domain"
 # Written to --output_dir when a training run starts; `--resume_model auto` reads it.
 RUN_ID_FILE = "last_run_id.txt"
 # model.clip parameters that belong to the text branch (see --freeze_text).
 TEXT_BRANCH_PREFIXES = ("token_embedding.", "positional_embedding", "transformer.", "ln_final.", "text_projection")
 
-def get_args(description='CLIP4Clip on Retrieval Task (single-GPU, MSRVTT)'):
+def get_args(description='CLIP4Clip on Retrieval Task (single-GPU; MSR-VTT, MSVD, ActivityNet)', argv=None):
     parser = argparse.ArgumentParser(description=description)
     parser.add_argument("--do_train", action='store_true', help="Whether to run training.")
     parser.add_argument("--do_eval", action='store_true', help="Whether to run eval on the dev set.")
 
-    parser.add_argument('--train_csv', type=str, default='data/.train.csv', help='')
+    parser.add_argument("--datatype", default="msrvtt", choices=DATATYPES,
+                        help="Dataset. msrvtt: splits are --train_csv/--val_csv/--test_csv and --data_path is "
+                             "the caption JSON. msvd / activity: --data_path is the directory written by "
+                             "dataloaders/prepare_<dataset>_dataset.py, holding the split and caption files.")
+    parser.add_argument('--train_csv', type=str, default='data/.train.csv', help='msrvtt only.')
     parser.add_argument('--val_csv', type=str, default='data/.val.csv',
-                        help='Evaluated after every epoch; the "best" checkpoint is chosen on it. Use a '
-                             'validation CSV from dataloaders/make_msrvtt_val_split.py so the test set '
+                        help='msrvtt only. Evaluated after every epoch; the "best" checkpoint is chosen on it. '
+                             'Use a validation CSV from dataloaders/make_msrvtt_val_split.py so the test set '
                              'stays untouched during training.')
     parser.add_argument('--test_csv', type=str, default=None,
-                        help='Held-out test CSV (MSRVTT_JSFUSION_test.csv). Only evaluated with --do_eval.')
-    parser.add_argument('--data_path', type=str, default='data/caption.pickle', help='data pickle file path')
-    parser.add_argument('--features_path', type=str, default='data/videos_feature.pickle', help='feature path')
+                        help='msrvtt only. Held-out test CSV (MSRVTT_JSFUSION_test.csv). Only evaluated with '
+                             '--do_eval.')
+    parser.add_argument('--data_path', type=str, default='data/caption.pickle',
+                        help='msrvtt: the caption JSON. msvd / activity: the split and caption directory.')
+    parser.add_argument('--features_path', type=str, default='data/videos_feature.pickle',
+                        help='Directory of the MPEG-4 re-encoded videos (searched recursively for msvd / activity).')
 
     parser.add_argument('--num_thread_reader', type=int, default=4, help='DataLoader worker processes')
     parser.add_argument('--lr', type=float, default=0.0001, help='initial learning rate')
@@ -137,8 +145,19 @@ def get_args(description='CLIP4Clip on Retrieval Task (single-GPU, MSRVTT)'):
     parser.add_argument("--mv_coef_lr", type=float, default=1.,
                         help="LR multiplier of the motion-vector encoder. Default 1 (trains at --lr).")
     parser.add_argument("--eval_on", default=None, choices=["val", "test"],
-                        help="With --do_eval: which CSV to evaluate. Default: test if --test_csv is given, "
-                             "else val.")
+                        help="With --do_eval: which split to evaluate. Default: test where it exists (msrvtt: "
+                             "when --test_csv is given; msvd: test_list.txt), else val (activity: val_1.json).")
+
+    # Flags of the original CLIP4Clip, accepted so its documented command lines
+    # run as they are. Only the values this model implements are allowed.
+    parser.add_argument("--loose_type", action='store_true',
+                        help="Accepted for compatibility; the similarity is always the loose (parameter-free) type.")
+    parser.add_argument("--linear_patch", default="2d", choices=["2d"],
+                        help="Accepted for compatibility; only the 2D patch embedding is implemented.")
+    parser.add_argument("--sim_header", default="meanP", choices=["meanP"],
+                        help="Accepted for compatibility; only mean pooling (meanP) is implemented.")
+    parser.add_argument("--local_rank", "--local-rank", default=0, type=int,
+                        help="Set by torch.distributed.launch; ignored. This script runs on one GPU.")
     parser.add_argument("--mlflow_tracking_uri", default=None, type=str,
                         help="Where mlflow keeps metrics and params. Default: sqlite:///<output_dir>/mlflow.db. "
                              "Point several runs at the same URI to see them side by side.")
@@ -157,7 +176,15 @@ def get_args(description='CLIP4Clip on Retrieval Task (single-GPU, MSRVTT)'):
                         help="Recompute the visual encoders' activations during backward instead of storing "
                              "them: much less GPU memory, roughly 30%% slower. Lets the batch size grow.")
 
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
+
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    if world_size > 1:
+        raise ValueError(
+            "This script runs on a single GPU, but it was launched as {} processes (WORLD_SIZE={}). Run it "
+            "directly, e.g. `python main_task_retrieval.py --datatype {} ...`, instead of through "
+            "torch.distributed.launch / torchrun with --nproc_per_node > 1.".format(
+                world_size, world_size, args.datatype))
 
     if args.gradient_accumulation_steps < 1:
         raise ValueError("Invalid gradient_accumulation_steps parameter: {}, should be >= 1".format(
@@ -486,10 +513,35 @@ def _compute_sim_matrix(model, batch_list_t, batch_list_v, batch_sequence_output
     return sim_matrix
 
 
+def _encode_captions(args, model, dataset, keep, device, use_amp):
+    """
+    Text side of a multi-sentence evaluation: dataset.caption_tokens() rows
+    `keep`, encoded in --batch_size_val chunks. Returns the batch lists
+    _compute_sim_matrix takes.
+    """
+    input_ids, input_mask, segment_ids = (torch.from_numpy(np.asarray(a)[keep]) for a in dataset.caption_tokens())
+    batch_list_t, batch_sequence_output_list = [], []
+    for start in range(0, len(input_ids), args.batch_size_val):
+        chunk = slice(start, start + args.batch_size_val)
+        ids, mask, segment = input_ids[chunk].to(device), input_mask[chunk].to(device), segment_ids[chunk].to(device)
+        with torch.autocast(device_type=device.type, enabled=use_amp):
+            sequence_output = model.get_sequence_output(ids, segment, mask)
+        batch_sequence_output_list.append(sequence_output.float())
+        batch_list_t.append((mask, segment))
+    return batch_list_t, batch_sequence_output_list
+
+
 def eval_epoch(args, model, test_dataloader, device, step=0, prefix="val"):
     """
-    Text-to-video and video-to-text retrieval over test_dataloader (one caption
-    per video). Metrics go to mlflow as <prefix>_* at `step`.
+    Text-to-video and video-to-text retrieval over test_dataloader. Metrics go
+    to mlflow as <prefix>_* at `step`.
+
+    One caption per video (MSR-VTT, ActivityNet): item i is video i and its
+    query caption. Several captions per video (MSVD, the dataset sets
+    multi_sentence_per_video): items are the videos, every caption of
+    dataset.caption_tokens() is a query and dataset.caption_video_index its
+    video; video-to-text scores a video against each video's best caption.
+
     Videos that failed to decode are excluded, together with their captions,
     and their count is reported.
 
@@ -499,6 +551,8 @@ def eval_epoch(args, model, test_dataloader, device, step=0, prefix="val"):
     model = model.to(device)
     model.eval()
     use_amp = args.precision == "amp" and device.type == "cuda"
+    dataset = test_dataloader.dataset
+    multi_sentence = bool(getattr(dataset, "multi_sentence_per_video", False))
     valid_flags = []
 
     with torch.no_grad():
@@ -518,12 +572,18 @@ def eval_epoch(args, model, test_dataloader, device, step=0, prefix="val"):
             pairs_text, pairs_mask, pairs_segment, iframe, iframe_mask, residuals, residuals_mask, mv, mv_mask = batch
 
             with torch.autocast(device_type=device.type, enabled=use_amp):
-                sequence_output, visual_output, video_mask = model.get_sequence_visual_output(
-                    pairs_text, pairs_segment, pairs_mask,
-                    iframe, iframe_mask, residuals, residuals_mask, mv, mv_mask)
+                if multi_sentence:
+                    # The item's caption only fills the slot; captions are encoded below.
+                    visual_output, video_mask = model.get_visual_output(
+                        iframe, iframe_mask, residuals, residuals_mask, mv, mv_mask)
+                else:
+                    sequence_output, visual_output, video_mask = model.get_sequence_visual_output(
+                        pairs_text, pairs_segment, pairs_mask,
+                        iframe, iframe_mask, residuals, residuals_mask, mv, mv_mask)
 
-            batch_sequence_output_list.append(sequence_output.float())
-            batch_list_t.append((pairs_mask, pairs_segment))
+            if not multi_sentence:
+                batch_sequence_output_list.append(sequence_output.float())
+                batch_list_t.append((pairs_mask, pairs_segment))
 
             batch_visual_output_list.append(visual_output.float())
             batch_list_v.append((video_mask,))
@@ -532,6 +592,17 @@ def eval_epoch(args, model, test_dataloader, device, step=0, prefix="val"):
 
         if not batch_list_v:
             raise RuntimeError("Evaluation ({}): no video could be decoded.".format(prefix))
+
+        valid_flags = np.concatenate(valid_flags).astype(bool)
+        gt_index = None
+        if multi_sentence:
+            # Captions of failed videos go too; the rest point at their video's
+            # row among the decoded videos.
+            caption_video_index = np.asarray(dataset.caption_video_index)
+            keep_captions = valid_flags[caption_video_index]
+            gt_index = (np.cumsum(valid_flags) - 1)[caption_video_index[keep_captions]]
+            batch_list_t, batch_sequence_output_list = _encode_captions(
+                args, model, dataset, keep_captions, device, use_amp)
 
         sim_matrix = _compute_sim_matrix(model, batch_list_t, batch_list_v,
                                           batch_sequence_output_list, batch_visual_output_list)
@@ -551,34 +622,34 @@ def eval_epoch(args, model, test_dataloader, device, step=0, prefix="val"):
                                            zip(batch_visual_output_list, batch_list_v)], dim=0).unsqueeze(1)
             branch_mask = torch.ones(branch_embeddings.shape[:2], dtype=torch.long)
 
-    valid_flags = np.concatenate(valid_flags).astype(bool)
     failed_videos = int((~valid_flags).sum())
-    dataset = test_dataloader.dataset
-    video_ids = np.asarray(dataset.csv["video_id"].values).astype(str)
-    if getattr(dataset, "csv_has_sentence", False):
-        captions = np.asarray(dataset.csv["sentence"].values).astype(str)
-    else:
-        captions = np.asarray([""] * len(video_ids))
+    video_ids = np.asarray(dataset.video_ids).astype(str)
+    captions = np.asarray(dataset.captions).astype(str)
     embeddings = {
         "text_embeddings": text_embeddings.cpu().numpy().astype(np.float32),
         "branch_embeddings": branch_embeddings.cpu().numpy().astype(np.float32),
         "branch_mask": branch_mask.cpu().numpy().astype(np.int8),
         "branches": np.asarray(branches),
         "video_ids": video_ids[valid_flags],
-        "captions": captions[valid_flags],
+        "captions": captions[keep_captions] if multi_sentence else captions[valid_flags],
         "failed_video_ids": video_ids[~valid_flags],
         "logit_scale": np.float32(model.clip.logit_scale.exp().item()),
         "visual_pooling": np.asarray(model.visual_pooling),
         "step": np.int64(step),
     }
+    if multi_sentence:
+        embeddings["caption_video_index"] = gt_index.astype(np.int64)
+
+    def text_to_video(sim):
+        return compute_metrics_multi(sim, gt_index) if multi_sentence else compute_metrics(sim)
 
     logger.info("[%s] sim matrix size: %d, %d", prefix, sim_matrix.shape[0], sim_matrix.shape[1])
     if failed_videos:
         logger.warning("[%s] %d videos failed to decode and were excluded from the metrics.", prefix, failed_videos)
     else:
         logger.info("[%s] failed videos: 0", prefix)
-    tv_metrics = compute_metrics(sim_matrix)
-    vt_metrics = compute_metrics(sim_matrix.T)
+    tv_metrics = text_to_video(sim_matrix)
+    vt_metrics = compute_metrics(video_to_text_similarity(sim_matrix, gt_index) if multi_sentence else sim_matrix.T)
     logger.info('\t Length-T: {}, Length-V:{}'.format(len(sim_matrix), len(sim_matrix[0])))
 
     logger.info("[%s] Text-to-Video:", prefix)
@@ -599,7 +670,8 @@ def eval_epoch(args, model, test_dataloader, device, step=0, prefix="val"):
         prefix + "_v2t_R10": vt_metrics['R10'],
         prefix + "_v2t_MedianR": float(vt_metrics['MR']),
         prefix + "_v2t_MeanR": float(vt_metrics['MeanR']),
-        prefix + "_num_candidates": float(sim_matrix.shape[0]),
+        prefix + "_num_candidates": float(sim_matrix.shape[1]),
+        prefix + "_num_queries": float(sim_matrix.shape[0]),
         prefix + "_num_failed_videos": float(failed_videos),
     }
 
@@ -607,7 +679,7 @@ def eval_epoch(args, model, test_dataloader, device, step=0, prefix="val"):
     if len(branches) > 1:
         logger.info("[%s] Text-to-Video using one branch alone:", prefix)
         for i, branch in enumerate(branches):
-            m = compute_metrics(branch_subset_similarity(
+            m = text_to_video(branch_subset_similarity(
                 embeddings["text_embeddings"], embeddings["branch_embeddings"], embeddings["branch_mask"], [i]))
             logger.info('\t>>>  %-8s R@1: %.1f - R@5: %.1f - R@10: %.1f - Median R: %.1f',
                         branch, m['R1'], m['R5'], m['R10'], m['MR'])
@@ -638,6 +710,22 @@ def save_embeddings(args, embeddings, split):
     mlflow.log_artifact(path, artifact_path="embeddings")
     logger.info("Embeddings (%s) saved to %s", split, path)
     return path
+
+
+def resolve_eval_split(args):
+    """
+    The split --do_eval evaluates: --eval_on, else test where the dataset has
+    one (for msrvtt: when --test_csv is given), else val.
+    """
+    has_test = DATALOADER_DICT[args.datatype]["test"] is not None
+    if args.datatype == "msrvtt":
+        has_test = has_test and bool(args.test_csv)
+    eval_on = args.eval_on or ("test" if has_test else "val")
+    if eval_on == "test" and not has_test:
+        if args.datatype == "msrvtt":
+            raise ValueError("--eval_on test needs --test_csv.")
+        raise ValueError("--datatype {} has no test split; evaluate on val.".format(args.datatype))
+    return eval_on
 
 
 def resolve_resume(args):
@@ -751,8 +839,8 @@ def main():
     # train and eval
     ## ####################################
     if args.do_train:
-        val_dataloader, val_length = DATALOADER_DICT[DATATYPE]["val"](args, tokenizer)
-        train_dataloader, train_length = DATALOADER_DICT[DATATYPE]["train"](args, tokenizer)
+        val_dataloader, val_length = DATALOADER_DICT[args.datatype]["val"](args, tokenizer)
+        train_dataloader, train_length = DATALOADER_DICT[args.datatype]["train"](args, tokenizer)
         logger.info("***** Running val *****")
         logger.info("  Num examples = %d", val_length)
         logger.info("  Batch size = %d", args.batch_size_val)
@@ -846,10 +934,8 @@ def main():
             session_epochs += 1
 
     elif args.do_eval:
-        eval_on = args.eval_on or ("test" if args.test_csv else "val")
-        if eval_on == "test" and not args.test_csv:
-            raise ValueError("--eval_on test needs --test_csv.")
-        eval_dataloader, eval_length = DATALOADER_DICT[DATATYPE][eval_on](args, tokenizer)
+        eval_on = resolve_eval_split(args)
+        eval_dataloader, eval_length = DATALOADER_DICT[args.datatype][eval_on](args, tokenizer)
         logger.info("***** Running %s *****", eval_on)
         logger.info("  Num examples = %d", eval_length)
         logger.info("  Batch size = %d", args.batch_size_val)
