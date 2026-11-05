@@ -14,7 +14,7 @@ from metrics import compute_metrics, compute_metrics_multi, video_to_text_simila
 import time
 import argparse
 from modules.tokenization_clip import SimpleTokenizer as ClipTokenizer
-from modules.modeling import CLIP4ClipCompressed, VISUAL_BRANCHES, VISUAL_POOLINGS, MV_INITS, BRANCH_ARCHS
+from modules.modeling import CLIP4ClipCompressed, VISUAL_BRANCHES, VISUAL_POOLINGS, FUSIONS, MV_INITS, BRANCH_ARCHS
 from modules.optimization import BertAdam
 
 from util import get_logger
@@ -121,6 +121,11 @@ def get_args(description='CLIP4Clip on Retrieval Task (single-GPU; MSR-VTT, MSVD
     parser.add_argument("--visual_pooling", default="modality", choices=VISUAL_POOLINGS,
                         help="modality: every modality weighs the same in the video embedding. "
                              "frame: one mean over all frames of all modalities (original behaviour).")
+    parser.add_argument("--fusion", default="mean", choices=FUSIONS,
+                        help="How the modality embeddings form the video embedding (modality pooling). "
+                             "mean: plain average (original). weighted: one learned weight per branch. "
+                             "gated: a small MLP gives every video its own branch weights, so a noisy "
+                             "branch can be turned down. Learned weights start equal and train at --lr.")
     parser.add_argument("--modality_loss_weight", type=float, default=0.,
                         help="Weight of an extra contrastive loss between the text and EACH branch's own "
                              "embedding (mean over branches). 0 = off. Makes every branch align with the "
@@ -280,36 +285,42 @@ def freeze_parameters(args, model):
 
 
 TOWER_PREFIXES = (("text", tuple("clip." + p for p in TEXT_BRANCH_PREFIXES)), ("iframe", ("clip.visual.",)),
-                  ("residual", ("residual_encoder.",)), ("mv", ("mv_encoder.",)))
+                  ("residual", ("residual_encoder.",)), ("mv", ("mv_encoder.",)), ("fusion", ("fusion_",)))
 
 
 def prep_optimizer(args, model, num_train_optimization_steps, coef_lr=1.):
     # Frozen parameters are left out entirely: no weight decay, no optimizer state.
     param_optimizer = [(n, p) for n, p in model.named_parameters() if p.requires_grad]
-    no_decay = ['bias', 'LayerNorm.bias', 'LayerNorm.weight']
+    no_decay = ['bias', 'LayerNorm.bias', 'LayerNorm.weight', 'fusion_logits']
 
     # Learning-rate classes, as multipliers of --lr:
     #   "clip":     model.clip (text + I-frame towers)            -> coef_lr
     #   "residual": the residual encoder, a copy of CLIP's visual -> residual_coef_lr (default coef_lr)
     #   "mv":       the motion-vector encoder                     -> mv_coef_lr (default 1)
+    #   "fusion":   the learned fusion weights / gate (--fusion)  -> 1
     # The residual encoder shares the "clip" groups unless it has its own
     # multiplier, so the default group layout never changes (optimizer
     # checkpoints stay loadable).
     residual_coef_lr = getattr(args, "residual_coef_lr", None)
     mv_coef_lr = getattr(args, "mv_coef_lr", 1.)
     split_residual = residual_coef_lr is not None and residual_coef_lr != coef_lr
-    multipliers = {"clip": coef_lr, "residual": residual_coef_lr, "mv": 1. if mv_coef_lr is None else mv_coef_lr}
+    multipliers = {"clip": coef_lr, "residual": residual_coef_lr, "mv": 1. if mv_coef_lr is None else mv_coef_lr,
+                   "fusion": 1.}
 
     def lr_class(n):
         if n.startswith("residual_encoder."):
             return "residual" if split_residual else "clip"
+        if n.startswith("fusion_"):
+            return "fusion"
         return "clip" if n.startswith("clip.") else "mv"
 
     def is_no_decay(n):
         return any(nd in n for nd in no_decay)
 
     weight_decay = 0.2
-    classes = ["clip", "mv"] + (["residual"] if split_residual else [])
+    # "fusion" comes last and only exists with --fusion weighted / gated, so the
+    # group layout of a mean-fusion run is unchanged.
+    classes = ["clip", "mv"] + (["residual"] if split_residual else []) + ["fusion"]
     optimizer_grouped_parameters = []
     for decay in (True, False):
         for name in classes:
@@ -488,6 +499,11 @@ def train_epoch(epoch, args, model, train_dataloader, device, optimizer, scaler,
                     "gpu_peak_gb": peak_gb,
                     "logit_scale": model.clip.logit_scale.exp().item(),
                 }, step=global_step)
+                if model.last_fusion_weights is not None:
+                    fusion = dict(zip(model.visual_branches, model.last_fusion_weights.tolist()))
+                    logger.info("  Fusion weights (batch mean): %s",
+                                ", ".join("{} {:.3f}".format(k, v) for k, v in fusion.items()))
+                    mlflow.log_metrics({"fusion_weight_" + k: v for k, v in fusion.items()}, step=global_step)
                 window_loss, window_batches = 0., 0
                 start_time = time.time()
 
@@ -615,12 +631,16 @@ def eval_epoch(args, model, test_dataloader, device, step=0, prefix="val"):
             branches = list(model.visual_branches)
             branch_embeddings = torch.cat(batch_visual_output_list, dim=0)
             branch_mask = torch.cat([v[0] for v in batch_list_v], dim=0)
+            # Each video's branch weights in its fused embedding (uniform for --fusion mean).
+            fusion_weights = model.fusion_weights(
+                branch_embeddings / branch_embeddings.norm(dim=-1, keepdim=True).clamp_min(1e-6), branch_mask)
         else:
             # Frame pooling has no per-branch embedding: store the pooled video as one pseudo-branch.
             branches = ["+".join(model.visual_branches)]
             branch_embeddings = torch.cat([model.pool_video(v, m[0]) for v, m in
                                            zip(batch_visual_output_list, batch_list_v)], dim=0).unsqueeze(1)
             branch_mask = torch.ones(branch_embeddings.shape[:2], dtype=torch.long)
+            fusion_weights = torch.ones(branch_embeddings.shape[:2])
 
     failed_videos = int((~valid_flags).sum())
     video_ids = np.asarray(dataset.video_ids).astype(str)
@@ -629,6 +649,7 @@ def eval_epoch(args, model, test_dataloader, device, step=0, prefix="val"):
         "text_embeddings": text_embeddings.cpu().numpy().astype(np.float32),
         "branch_embeddings": branch_embeddings.cpu().numpy().astype(np.float32),
         "branch_mask": branch_mask.cpu().numpy().astype(np.int8),
+        "fusion_weights": fusion_weights.cpu().numpy().astype(np.float32),
         "branches": np.asarray(branches),
         "video_ids": video_ids[valid_flags],
         "captions": captions[keep_captions] if multi_sentence else captions[valid_flags],
@@ -675,6 +696,12 @@ def eval_epoch(args, model, test_dataloader, device, step=0, prefix="val"):
         prefix + "_num_failed_videos": float(failed_videos),
     }
 
+    if model.fusion != "mean":
+        mean_weights = dict(zip(branches, embeddings["fusion_weights"].mean(axis=0).tolist()))
+        logger.info("[%s] Fusion weights (mean over videos): %s", prefix,
+                    ", ".join("{} {:.3f}".format(k, v) for k, v in mean_weights.items()))
+        to_log.update({"{}_fusion_weight_{}".format(prefix, k): v for k, v in mean_weights.items()})
+
     # What each branch retrieves BY ITSELF inside this jointly trained model.
     if len(branches) > 1:
         logger.info("[%s] Text-to-Video using one branch alone:", prefix)
@@ -700,6 +727,7 @@ def save_embeddings(args, embeddings, split):
         text_embeddings   (N, D)     L2-normalised caption embeddings
         branch_embeddings (N, M, D)  one video embedding per built visual branch
         branch_mask       (N, M)     1 where the video has that branch
+        fusion_weights    (N, M)     each branch's weight in the fused video embedding (--fusion)
         branches          (M,)       branch names, in the order of the M axis
         video_ids, captions (N,)     row i's caption is the query for row i's video
         failed_video_ids, logit_scale, visual_pooling, step

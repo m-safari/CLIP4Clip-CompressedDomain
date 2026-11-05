@@ -52,6 +52,15 @@ def resolve_visual_branches(task_config):
 #               behaviour); a modality's weight is its share of the frames.
 VISUAL_POOLINGS = ("modality", "frame")
 
+# How the modality embeddings are combined into the video embedding (modality pooling only).
+#   "mean":     plain average; a noisy branch weighs as much as the I-frames. The original.
+#   "weighted": one learned softmax weight per branch, shared by every video.
+#   "gated":    a small MLP looks at the video's branch embeddings and outputs its own
+#               softmax weights, so a branch can be turned down where it is only noise.
+# Both learned variants start at equal weights, i.e. exactly where "mean" starts.
+FUSIONS = ("mean", "weighted", "gated")
+FUSION_GATE_HIDDEN = 256
+
 # Initialisation of the motion-vector encoder (see from_pretrained).
 MV_INITS = ("random", "clip")
 
@@ -90,6 +99,15 @@ def resolve_visual_pooling(task_config):
     if pooling not in VISUAL_POOLINGS:
         raise ValueError("Unknown visual_pooling {!r}; valid values are {}".format(pooling, VISUAL_POOLINGS))
     return pooling
+
+
+def resolve_fusion(task_config):
+    fusion = getattr(task_config, "fusion", None) or "mean"
+    if fusion not in FUSIONS:
+        raise ValueError("Unknown fusion {!r}; valid values are {}".format(fusion, FUSIONS))
+    if fusion != "mean" and resolve_visual_pooling(task_config) != "modality":
+        raise ValueError("fusion {!r} needs visual_pooling 'modality'".format(fusion))
+    return fusion
 
 
 def _safe_normalize(x, eps=1e-6):
@@ -226,6 +244,8 @@ class CLIP4ClipCompressed(CLIP4ClipPreTrainedModel):
     each modality's frames are mean-pooled first and the modality embeddings are
     then averaged, so every modality has the same weight. With "frame", all
     frames of all modalities share one masked mean (the original behaviour).
+    `task_config.fusion` (see FUSIONS) replaces the modality average by learned
+    weights, globally or per video through a gate.
 
     Similarity: loose (cosine) similarity only. No tight/cross-attention path.
     Loss: CrossEn (the same symmetric contrastive loss as stock CLIP4Clip).
@@ -315,6 +335,19 @@ class CLIP4ClipCompressed(CLIP4ClipPreTrainedModel):
         self.visual_pooling = resolve_visual_pooling(task_config)
         show_log(task_config, "visual_pooling: {}".format(self.visual_pooling))
 
+        # Learned fusion of the modality embeddings (see FUSIONS and fusion_weights).
+        self.fusion = resolve_fusion(task_config)
+        show_log(task_config, "fusion: {}".format(self.fusion))
+        n_branches = len(self.visual_branches)
+        if self.fusion == "weighted":
+            self.fusion_logits = nn.Parameter(torch.zeros(n_branches))
+        elif self.fusion == "gated":
+            self.fusion_gate = nn.Sequential(
+                nn.Linear(n_branches * embed_dim, FUSION_GATE_HIDDEN), nn.ReLU(),
+                nn.Linear(FUSION_GATE_HIDDEN, n_branches))
+        # Mean branch weights of the last training batch, for the training log.
+        self.last_fusion_weights = None
+
         # Weight of the per-branch auxiliary losses (see forward). 0 = off.
         self.modality_loss_weight = float(getattr(task_config, "modality_loss_weight", 0.) or 0.)
         show_log(task_config, "modality_loss_weight: {}".format(self.modality_loss_weight))
@@ -328,6 +361,10 @@ class CLIP4ClipCompressed(CLIP4ClipPreTrainedModel):
         self.loss_fct = CrossEn()
 
         self.apply(self.init_weights)
+        if self.fusion == "gated":
+            # Zero output layer: every video starts at equal branch weights.
+            nn.init.zeros_(self.fusion_gate[-1].weight)
+            nn.init.zeros_(self.fusion_gate[-1].bias)
 
     # ---------------------------------------------------------------- #
     # Encoding
@@ -458,8 +495,31 @@ class CLIP4ClipCompressed(CLIP4ClipPreTrainedModel):
         callers exclude such videos (see valid_video_rows).
         """
         visual_output = _safe_normalize(visual_output.contiguous())
-        visual_output = self._mean_pooling_for_similarity_visual(visual_output, video_mask)
+        if self.fusion == "mean":
+            visual_output = self._mean_pooling_for_similarity_visual(visual_output, video_mask)
+        else:
+            weights = self.fusion_weights(visual_output, video_mask)
+            if self.training:
+                self.last_fusion_weights = weights.detach().mean(dim=0)
+            visual_output = torch.sum(visual_output * weights.unsqueeze(-1), dim=1)
         return visual_output / visual_output.norm(dim=-1, keepdim=True)
+
+    def fusion_weights(self, branch_embeddings, branch_mask):
+        """
+        (B, M) softmax weights of the M built branches in each video's embedding,
+        from L2-normalised modality embeddings (B, M, D) and their (B, M) mask.
+        A branch the video lacks gets weight 0; a video with no branch gets NaN,
+        like pool_video. "mean" fusion is the uniform weighting over present branches.
+        """
+        present = branch_mask > 0
+        if self.fusion == "mean":
+            logits = torch.zeros(present.shape, device=branch_embeddings.device)
+        elif self.fusion == "weighted":
+            logits = self.fusion_logits.float().expand(present.shape)
+        else:
+            gate_input = (branch_embeddings * present.unsqueeze(-1)).flatten(1)
+            logits = self.fusion_gate(gate_input).float()
+        return torch.softmax(logits.masked_fill(~present, float("-inf")), dim=-1)
 
     def _loose_similarity(self, sequence_output, visual_output, attention_mask, video_mask):
         sequence_output = sequence_output.contiguous()
