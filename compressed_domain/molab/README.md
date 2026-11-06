@@ -33,7 +33,9 @@ bash eval_all.sh > /home/marimo/eval.log 2>&1
 repo and run id in step 2 to evaluate another run. ActivityNet with 64 GOPs needs
 `--batch_size_val 2`: at 8, the queued batches of 16 workers took over 100 GB of RAM.
 
-## Results (text-to-video R@1)
+## Results
+
+Text-to-video R@1:
 
 | | Combined | I-frame alone | Residual alone | Motion vector alone |
 |---|---|---|---|---|
@@ -42,12 +44,27 @@ repo and run id in step 2 to evaluate another run. ActivityNet with 64 GOPs need
 | MSVD test, gated best, zero-shot | 38.1 | 41.5 | 19.0 | 0.8 |
 | ActivityNet val_1, gated best, zero-shot | 23.6 | 25.9 | 12.1 | 0.1 |
 
+Video-to-text R@1 / R@5 / R@10 (MSVD: a video scores each caption set by its best caption, as in CLIP4Clip):
+
+| | Combined | I-frame alone | Residual alone | Motion vector alone |
+|---|---|---|---|---|
+| MSR-VTT val, mean fusion, best (epoch 1 of 8) | 33.5 / 58.4 / 69.8 | – | – | – |
+| MSR-VTT val, gated fusion, best (epoch 2 of 9) | 32.8 / 58.7 / 69.9 | – | – | – |
+| MSVD test, gated best, zero-shot | 57.5 / 84.6 / 90.0 | 64.3 / 89.0 / 94.2 | 23.0 / 47.3 / 57.3 | 0.3 / 2.8 / 5.5 |
+| ActivityNet val_1, gated best, zero-shot | 23.6 / 49.4 / 63.4 | 24.9 / 52.7 / 65.2 | 9.2 / 24.5 / 35.0 | 0.1 / 0.3 / 0.8 |
+
+The per-branch video-to-text numbers come from the saved `embeddings_*.npz` (the training
+loop only logs them for text-to-video); recomputing the combined rows from the same files
+reproduces the logged values exactly. MSR-VTT per-branch video-to-text is missing because
+only the last epoch's embeddings are kept.
+
 Gated run per epoch (MSR-VTT val):
 
 | Epoch | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 |
 |---|---|---|---|---|---|---|---|---|---|
 | Combined R@1 | 33.3 | **33.9** | 31.8 | 31.7 | 28.3 | 27.7 | 26.6 | 27.1 | 26.3 |
 | I-frame alone | 32.2 | 34.2 | 34.5 | 35.4 | 35.3 | 35.2 | 35.1 | 35.1 | 35.1 |
+| Combined video-to-text R@1 | 31.9 | 32.8 | 29.8 | 27.5 | 28.0 | 25.5 | 25.0 | 24.0 | 22.7 |
 | Gate weight I-frame / residual / MV | .43/.44/.14 | .42/.47/.11 | .35/.50/.15 | .32/.51/.17 | .26/.53/.21 | .23/.53/.24 | .18/.55/.27 | .16/.53/.31 | .14/.54/.32 |
 
 The gate is trained on the training loss, so it moves weight to the residual and motion-vector
